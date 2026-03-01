@@ -551,107 +551,174 @@ def get_constraint_routes(stage: Stage, constraint_name: str) -> Tuple[str, str]
 
 
 def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, links: List[Tuple[str, str, str]]) -> str:
-    node_ids = {s.name: sanitize_id(s.name, f"stage_{i}") for i, s in enumerate(stages, 1)}
-    source_entity_nodes: Dict[str, str] = {}
-    for s in stages:
-        for entity, _ in s.source_entities:
-            source_entity_nodes[entity] = sanitize_id(f"src_{entity}", f"src_{len(source_entity_nodes)+1}")
+    stage_by_name = {s.name: s for s in stages}
+    downstream: Dict[str, List[Tuple[str, str]]] = {}
+    for src, dst, lbl in links:
+        downstream.setdefault(src, []).append((dst, lbl))
 
-    def stage_summary_label(stage: Stage) -> str:
-        parts = [stage.name]
-        if stage.join_blocks:
-            parts.append(f"Joins: {len(stage.join_blocks)}")
-        if stage.transformations:
-            mapped = sum(1 for t in stage.transformations if t.target_col != "Unknown")
-            if mapped:
-                parts.append(f"Mapped columns: {mapped}")
-        if stage.constraints:
-            parts.append(f"Constraints: {len(stage.constraints)}")
-        return "\\n".join(parts)
+    transformer_stage = next(
+        (s for s in stages if "transformer" in s.stage_type.lower() or s.name.lower().startswith("tfm_")),
+        next((s for s in stages if classify_stage_role(s) == "processing"), stages[0]),
+    )
+    source_stage = next(
+        (s for s in stages if classify_stage_role(s) == "source" and s.name != "HF_SMR_VEHICLE_DIM"),
+        next((s for s in stages if classify_stage_role(s) == "source"), transformer_stage),
+    )
+
+    input_link_to_stage: Dict[str, str] = {}
+    for s in stages:
+        for _, _, link_name in s.inputs:
+            if link_name:
+                input_link_to_stage[link_name] = s.name
+
+    lookup_stage_names = set()
+    source_to_transform_link = "Unknown"
+    lookup_links: List[Tuple[str, str]] = []
+    for _, _, link_name in transformer_stage.inputs:
+        producer_name = None
+        for src, dst, lbl in links:
+            if dst == transformer_stage.name and lbl:
+                producer_name = src
+        # Map lookup style links first.
+        if link_name and link_name.lower().startswith("lk"):
+            if producer_name and producer_name in stage_by_name:
+                lookup_stage_names.add(producer_name)
+                lookup_links.append((producer_name, link_name))
+            continue
+        if link_name and source_to_transform_link == "Unknown":
+            source_to_transform_link = link_name
+
+    for s in stages:
+        if s.has_lookup:
+            lookup_stage_names.add(s.name)
+
+    lookup_stages = [stage_by_name[n] for n in lookup_stage_names if n in stage_by_name and n != transformer_stage.name]
+
+    yes_stage_name = None
+    no_stage_name = None
+    constraint_expr = ""
+    if transformer_stage.constraints:
+        c = transformer_stage.constraints[0]
+        constraint_expr = c.expression
+        yes_out, no_out = get_constraint_routes(transformer_stage, c.name)
+        yes_stage_name = input_link_to_stage.get(yes_out)
+        no_stage_name = input_link_to_stage.get(no_out)
+
+    transformer_children = [dst for dst, _ in downstream.get(transformer_stage.name, [])]
+    if not yes_stage_name and transformer_children:
+        yes_stage_name = transformer_children[0]
+    if not no_stage_name and len(transformer_children) > 1:
+        no_stage_name = transformer_children[1]
+
+    target_chain: List[str] = []
+    if yes_stage_name:
+        target_chain.append(yes_stage_name)
+        for nxt, _ in downstream.get(yes_stage_name, []):
+            if nxt not in target_chain:
+                target_chain.append(nxt)
+    if no_stage_name and no_stage_name not in target_chain:
+        target_chain.append(no_stage_name)
+
+    success_stage_name = yes_stage_name
+    exception_stage_name = no_stage_name
+    if yes_stage_name and no_stage_name:
+        yes_stage = stage_by_name.get(yes_stage_name)
+        no_stage = stage_by_name.get(no_stage_name)
+        yes_is_exception = yes_stage and ("seqfile" in yes_stage.stage_type.lower() or "exception" in yes_stage.name.lower())
+        no_is_exception = no_stage and ("seqfile" in no_stage.stage_type.lower() or "exception" in no_stage.name.lower())
+        if yes_is_exception and not no_is_exception:
+            success_stage_name = no_stage_name
+            exception_stage_name = yes_stage_name
+        elif no_is_exception and not yes_is_exception:
+            success_stage_name = yes_stage_name
+            exception_stage_name = no_stage_name
 
     lines = [
         f'digraph {sanitize_id(graph_name, "lineage_graph")} {{',
-        f"rankdir={rankdir};",
+        "rankdir=LR;",
+        "nodesep=0.5;",
+        "ranksep=1.0;",
         'fontsize=10;',
         'fontname="Arial";',
-        'node [fontname="Arial", fontsize=9, style=filled, fillcolor="white"];',
+        f'label="{dot_escape(graph_name)} Data Lineage Diagram";',
+        'labelloc="t";',
+        'node [shape=box, style="filled", fontname="Arial", fontsize=10];',
         'edge [fontname="Arial", fontsize=8];',
         "",
-        "subgraph cluster_source {",
-        'label="STEP 1 - SOURCE SYSTEMS";',
-        "fontsize=10;",
-        "style=filled,rounded;",
-        'color="#CFE2F3";',
-        'fillcolor="#CFE2F3";',
+        "subgraph cluster_0 {",
+        'label="Source Layer";',
+        "style=dashed;",
+        "color=grey;",
+        f'Source_DB [label="{dot_escape(source_stage.name)}", fillcolor="#FFD1DC"];',
+        "}",
+        "",
+        "subgraph cluster_1 {",
+        'label="Reference Data";',
+        "style=dashed;",
+        "color=blue;",
     ]
-    for entity, nid in source_entity_nodes.items():
-        lines.append(f'{nid} [label="{dot_escape(entity)}", shape=cylinder];')
-    for s in stages:
-        if classify_stage_role(s) == "source":
-            lines.append(f'{node_ids[s.name]} [label="{dot_escape(stage_summary_label(s))}", shape={node_shape(s)}];')
+    for i, lk in enumerate(lookup_stages, 1):
+        lines.append(
+            f'Lookup_{i} [label="{dot_escape(lk.name)}", fillcolor="#E1F5FE", shape=cylinder];'
+        )
     lines.extend(
         [
             "}",
             "",
-            "subgraph cluster_processing {",
-            'label="STEP 2 - INTEGRATION AND RULES";',
-            "fontsize=10;",
-            "style=filled,rounded;",
-            'color="#FFF2CC";',
-            'fillcolor="#FFF2CC";',
-        ]
-    )
-    for s in stages:
-        if classify_stage_role(s) in {"processing", "lookup"}:
-            lines.append(f'{node_ids[s.name]} [label="{dot_escape(stage_summary_label(s))}", shape={node_shape(s)}];')
-            if s.constraints:
-                for cidx, c in enumerate(s.constraints, 1):
-                    dec_id = f"{node_ids[s.name]}_decision_{cidx}"
-                    lines.append(f'{dec_id} [label="{dot_escape(c.expression)}", shape=diamond, fillcolor="white"];')
-    lines.extend(
-        [
+            "subgraph cluster_2 {",
+            'label="Business Logic Stage";',
+            "style=solid;",
+            f'Transformer [label="{dot_escape(transformer_stage.name)}", fillcolor="#FFF9C4"];',
             "}",
             "",
-            "subgraph cluster_target {",
-            'label="STEP 3 - TARGET OUTPUT";',
-            "fontsize=10;",
-            "style=filled,rounded;",
-            'color="#E2D5F9";',
-            'fillcolor="#E2D5F9";',
+            "subgraph cluster_3 {",
+            'label="Target Layer";',
+            "style=dashed;",
+            "color=green;",
         ]
     )
-    for s in stages:
-        if classify_stage_role(s) == "target":
-            lines.append(f'{node_ids[s.name]} [label="{dot_escape(stage_summary_label(s))}", shape={node_shape(s)}];')
+
+    target_node_by_stage: Dict[str, str] = {}
+    t_idx = 1
+    for name in target_chain:
+        stage = stage_by_name.get(name)
+        if not stage:
+            continue
+        nid = f"Target_{t_idx}"
+        t_idx += 1
+        target_node_by_stage[name] = nid
+        shape = "note" if ("seqfile" in stage.stage_type.lower() or "exception" in stage.name.lower()) else "cylinder"
+        fill = "#FFCCBC" if shape == "note" else "#C8E6C9"
+        lines.append(f'{nid} [label="{dot_escape(stage.name)}", fillcolor="{fill}", shape={shape}];')
     lines.append("}")
+    lines.append("")
 
-    for s in stages:
-        sid = node_ids[s.name]
-        for entity, rel in s.source_entities:
-            src_node = source_entity_nodes.get(entity)
-            if src_node:
-                lines.append(f'{src_node} -> {sid} [label="{dot_escape(rel)}"];')
+    lines.append(f'Source_DB -> Transformer [label="{dot_escape(source_to_transform_link)}"];')
+    for i, (_, link_name) in enumerate(lookup_links, 1):
+        if i <= len(lookup_stages):
+            lines.append(
+                f'Lookup_{i} -> Transformer [label="{dot_escape(link_name)}", style=dotted];'
+            )
 
-    for src, dst, label in links:
-        src_id = node_ids.get(src, "Unknown")
-        dst_id = node_ids.get(dst, "Unknown")
-        if src_id == "Unknown":
-            lines.append('Unknown [label="Unknown", shape=cylinder];')
-            src_id = "Unknown"
-        lines.append(f'{src_id} -> {dst_id} [label="Transformation: {dot_escape(label)}"];')
+    if success_stage_name and success_stage_name in target_node_by_stage:
+        label = "Success Path"
+        if constraint_expr:
+            label = f"Success Path\\n({constraint_expr} false)"
+        lines.append(
+            f'Transformer -> {target_node_by_stage[success_stage_name]} [label="{dot_escape(label)}", color=blue];'
+        )
+    if exception_stage_name and exception_stage_name in target_node_by_stage:
+        label = "Exception Path"
+        if constraint_expr:
+            label = f"Exception Path\\n({constraint_expr} true)"
+        lines.append(
+            f'Transformer -> {target_node_by_stage[exception_stage_name]} [label="{dot_escape(label)}", color=red, fontcolor=red];'
+        )
 
-    for s in stages:
-        sid = node_ids[s.name]
-        for cidx, c in enumerate(s.constraints, 1):
-            dec_id = f"{sid}_decision_{cidx}"
-            yes_target, no_target = get_constraint_routes(s, c.name)
-            yes_id = f"{sid}_hl_yes_{sanitize_id(yes_target, 'yes')}"
-            no_id = f"{sid}_hl_no_{sanitize_id(no_target, 'no')}"
-            lines.append(f'{yes_id} [label="{dot_escape(yes_target)}", shape=folder];')
-            lines.append(f'{no_id} [label="{dot_escape(no_target)}", shape=folder];')
-            lines.append(f'{sid} -> {dec_id} [label="Constraint"];')
-            lines.append(f'{dec_id} -> {yes_id} [label="Yes"];')
-            lines.append(f'{dec_id} -> {no_id} [label="No"];')
+    for src_name, src_node in target_node_by_stage.items():
+        for dst_name, _ in downstream.get(src_name, []):
+            if dst_name in target_node_by_stage:
+                lines.append(f"{src_node} -> {target_node_by_stage[dst_name]};")
 
     lines.append("}")
     return "\n".join(lines)
