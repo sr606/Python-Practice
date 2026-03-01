@@ -51,6 +51,7 @@ class Stage:
     output_links: List[str] = field(default_factory=list)
     alias_map: Dict[str, str] = field(default_factory=dict)
     join_blocks: List[JoinBlock] = field(default_factory=list)
+    source_entities: List[Tuple[str, str]] = field(default_factory=list)
     has_explicit_join_stage: bool = False
     has_lookup: bool = False
 
@@ -351,6 +352,51 @@ def parse_structured_joins(sql_text: str, alias_map: Dict[str, str]) -> List[Joi
     return joins
 
 
+def parse_source_entities(sql_text: str, join_blocks: List[JoinBlock]) -> List[Tuple[str, str]]:
+    entities: List[Tuple[str, str]] = []
+    seen = set()
+
+    # Prefer physical schema.table names explicitly present in SQL FROM/JOIN clauses.
+    for m in re.finditer(r"(?is)\b(from|join)\s+([A-Za-z0-9_.$#]+)", sql_text):
+        relation_kw = m.group(1).upper()
+        token = m.group(2).strip("()")
+        if token.lower() == "select":
+            continue
+        if "." not in token:
+            continue
+        key = token.lower()
+        if key not in seen:
+            rel = "Source" if relation_kw == "FROM" else "JOIN"
+            entities.append((token, rel))
+            seen.add(key)
+
+    # If physical tables were found, do not add alias-only fallback nodes.
+    if entities:
+        return entities
+
+    from_block = extract_from_block(sql_text)
+    if from_block and not entities:
+        table_name, alias, _ = _parse_join_target(from_block)
+        display = alias if table_name in {"Subquery", "RawJoin"} and alias else table_name
+        display = display if display not in {"Subquery", "RawJoin"} else "SourceBlock"
+        key = display.lower()
+        if key not in seen:
+            entities.append((display, "Source"))
+            seen.add(key)
+
+    for jb in join_blocks:
+        display = jb.table_name
+        if display in {"Subquery", "RawJoin"}:
+            display = jb.alias if jb.alias and jb.alias not in {"Subquery", "RawJoin"} else "JoinBlock"
+        rel = "LEFT JOIN" if "LEFT" in jb.join_type else "JOIN"
+        key = display.lower()
+        if key not in seen:
+            entities.append((display, rel))
+            seen.add(key)
+
+    return entities
+
+
 def parse_stages(text: str) -> List[Stage]:
     parsed: List[Stage] = []
     for header, block in parse_stage_blocks(text):
@@ -381,6 +427,7 @@ def parse_stages(text: str) -> List[Stage]:
             output_links=output_links,
             alias_map=alias_map,
             join_blocks=join_blocks,
+            source_entities=parse_source_entities(sql_text, join_blocks),
             has_explicit_join_stage=("join" in stage_type.lower()),
             has_lookup=("lookup" in stage_type.lower() and re.search(r"\breference\b", block, re.IGNORECASE) is not None),
         )
@@ -505,49 +552,85 @@ def get_constraint_routes(stage: Stage, constraint_name: str) -> Tuple[str, str]
 
 def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, links: List[Tuple[str, str, str]]) -> str:
     node_ids = {s.name: sanitize_id(s.name, f"stage_{i}") for i, s in enumerate(stages, 1)}
+    source_entity_nodes: Dict[str, str] = {}
+    for s in stages:
+        for entity, _ in s.source_entities:
+            source_entity_nodes[entity] = sanitize_id(f"src_{entity}", f"src_{len(source_entity_nodes)+1}")
+
+    def stage_summary_label(stage: Stage) -> str:
+        parts = [stage.name]
+        if stage.join_blocks:
+            parts.append(f"Joins: {len(stage.join_blocks)}")
+        if stage.transformations:
+            mapped = sum(1 for t in stage.transformations if t.target_col != "Unknown")
+            if mapped:
+                parts.append(f"Mapped columns: {mapped}")
+        if stage.constraints:
+            parts.append(f"Constraints: {len(stage.constraints)}")
+        return "\\n".join(parts)
+
     lines = [
         f'digraph {sanitize_id(graph_name, "lineage_graph")} {{',
         f"rankdir={rankdir};",
         'fontsize=10;',
         'fontname="Arial";',
-        'node [fontname="Arial"];',
-        'edge [fontname="Arial"];',
+        'node [fontname="Arial", fontsize=9, style=filled, fillcolor="white"];',
+        'edge [fontname="Arial", fontsize=8];',
         "",
         "subgraph cluster_source {",
-        'label="Source";',
+        'label="STEP 1 - SOURCE SYSTEMS";',
         "fontsize=10;",
-        "style=rounded;",
+        "style=filled,rounded;",
+        'color="#CFE2F3";',
+        'fillcolor="#CFE2F3";',
     ]
+    for entity, nid in source_entity_nodes.items():
+        lines.append(f'{nid} [label="{dot_escape(entity)}", shape=cylinder];')
     for s in stages:
         if classify_stage_role(s) == "source":
-            lines.append(f'{node_ids[s.name]} [label="{dot_escape(s.name)}", shape={node_shape(s)}];')
+            lines.append(f'{node_ids[s.name]} [label="{dot_escape(stage_summary_label(s))}", shape={node_shape(s)}];')
     lines.extend(
         [
             "}",
             "",
             "subgraph cluster_processing {",
-            'label="Processing";',
+            'label="STEP 2 - INTEGRATION AND RULES";',
             "fontsize=10;",
-            "style=rounded;",
+            "style=filled,rounded;",
+            'color="#FFF2CC";',
+            'fillcolor="#FFF2CC";',
         ]
     )
     for s in stages:
         if classify_stage_role(s) in {"processing", "lookup"}:
-            lines.append(f'{node_ids[s.name]} [label="{dot_escape(s.name)}", shape={node_shape(s)}];')
+            lines.append(f'{node_ids[s.name]} [label="{dot_escape(stage_summary_label(s))}", shape={node_shape(s)}];')
+            if s.constraints:
+                for cidx, c in enumerate(s.constraints, 1):
+                    dec_id = f"{node_ids[s.name]}_decision_{cidx}"
+                    lines.append(f'{dec_id} [label="{dot_escape(c.expression)}", shape=diamond, fillcolor="white"];')
     lines.extend(
         [
             "}",
             "",
             "subgraph cluster_target {",
-            'label="Target";',
+            'label="STEP 3 - TARGET OUTPUT";',
             "fontsize=10;",
-            "style=rounded;",
+            "style=filled,rounded;",
+            'color="#E2D5F9";',
+            'fillcolor="#E2D5F9";',
         ]
     )
     for s in stages:
         if classify_stage_role(s) == "target":
-            lines.append(f'{node_ids[s.name]} [label="{dot_escape(s.name)}", shape={node_shape(s)}];')
+            lines.append(f'{node_ids[s.name]} [label="{dot_escape(stage_summary_label(s))}", shape={node_shape(s)}];')
     lines.append("}")
+
+    for s in stages:
+        sid = node_ids[s.name]
+        for entity, rel in s.source_entities:
+            src_node = source_entity_nodes.get(entity)
+            if src_node:
+                lines.append(f'{src_node} -> {sid} [label="{dot_escape(rel)}"];')
 
     for src, dst, label in links:
         src_id = node_ids.get(src, "Unknown")
@@ -556,6 +639,19 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
             lines.append('Unknown [label="Unknown", shape=cylinder];')
             src_id = "Unknown"
         lines.append(f'{src_id} -> {dst_id} [label="Transformation: {dot_escape(label)}"];')
+
+    for s in stages:
+        sid = node_ids[s.name]
+        for cidx, c in enumerate(s.constraints, 1):
+            dec_id = f"{sid}_decision_{cidx}"
+            yes_target, no_target = get_constraint_routes(s, c.name)
+            yes_id = f"{sid}_hl_yes_{sanitize_id(yes_target, 'yes')}"
+            no_id = f"{sid}_hl_no_{sanitize_id(no_target, 'no')}"
+            lines.append(f'{yes_id} [label="{dot_escape(yes_target)}", shape=folder];')
+            lines.append(f'{no_id} [label="{dot_escape(no_target)}", shape=folder];')
+            lines.append(f'{sid} -> {dec_id} [label="Constraint"];')
+            lines.append(f'{dec_id} -> {yes_id} [label="Yes"];')
+            lines.append(f'{dec_id} -> {no_id} [label="No"];')
 
     lines.append("}")
     return "\n".join(lines)
@@ -594,9 +690,20 @@ def build_detailed_dot(
             lines.append(f'{sid} -> {sid} [style=dashed, label="Lookup"];')
         for idx, jb in enumerate(s.join_blocks, 1):
             jnid = f"{sid}_join_{idx}"
-            join_label = f"{jb.join_type} {jb.table_name} as {jb.alias}"
+            table_label = jb.table_name
+            alias_label = jb.alias
+            if table_label in {"Subquery", "RawJoin"}:
+                table_label = "Subquery" if table_label == "Subquery" else "Join Block"
+            if alias_label in {"Subquery", "RawJoin", "Unknown"}:
+                alias_label = ""
+            join_label = f"{jb.join_type} {table_label}".strip()
+            if alias_label:
+                join_label = f"{join_label} as {alias_label}"
             lines.append(f'{jnid} [label="{dot_escape(join_label)}", shape=box];')
-            cond = jb.resolved_condition if jb.resolved_condition else jb.raw_join
+            if jb.table_name in {"Subquery", "RawJoin"}:
+                cond = jb.join_condition if jb.join_condition else jb.raw_join
+            else:
+                cond = jb.resolved_condition if jb.resolved_condition else jb.raw_join
             lines.append(f'{sid} -> {jnid} [label="Join: {dot_escape(cond)}"];')
         for cidx, c in enumerate(s.constraints, 1):
             cnid = f"{sid}_constraint_{cidx}"
