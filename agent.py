@@ -208,40 +208,135 @@ def build_alias_map(sql_text: str) -> Dict[str, str]:
     alias_map: Dict[str, str] = {}
     from_block = extract_from_block(sql_text)
     if from_block:
-        m = re.match(r"(?is)([A-Za-z0-9_.$#]+)\s+([A-Za-z_]\w*)\b", from_block)
+        m = re.match(r"(?is)([A-Za-z0-9_.$#]+)\s+([A-Za-z_]\w*)\b", from_block.strip())
         if m:
-            alias_map[m.group(2)] = m.group(1)
+            alias_map[m.group(2).lower()] = m.group(1)
 
-    join_pattern = re.compile(
-        r"(?is)\b(?:left|right|full|inner|outer|cross)?\s*join\s+([A-Za-z0-9_.$#()]+)\s+([A-Za-z_]\w*)\b"
-    )
-    for m in join_pattern.finditer(sql_text):
-        alias_map[m.group(2)] = m.group(1).strip("()")
+    for jb in parse_structured_joins(sql_text, {}):
+        if jb.alias:
+            alias_map[jb.alias.lower()] = jb.table_name
     return alias_map
 
 
 def resolve_aliases(expr: str, alias_map: Dict[str, str]) -> str:
     resolved = expr
     for alias, table in sorted(alias_map.items(), key=lambda x: len(x[0]), reverse=True):
-        resolved = re.sub(rf"\b{re.escape(alias)}\.", f"{table}.", resolved)
+        if table.lower() in {"subquery", "unknown", "rawjoin"}:
+            continue
+        resolved = re.sub(
+            rf"\b{re.escape(alias)}\.",
+            f"{table}.",
+            resolved,
+            flags=re.IGNORECASE,
+        )
     return resolved
+
+
+def _find_top_level_keyword(sql: str, keyword_regex: str, start_idx: int = 0) -> int:
+    depth = 0
+    idx = start_idx
+    pat = re.compile(keyword_regex, re.IGNORECASE)
+    while idx < len(sql):
+        ch = sql[idx]
+        if ch == "(":
+            depth += 1
+            idx += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            idx += 1
+            continue
+        if depth == 0:
+            m = pat.match(sql, idx)
+            if m:
+                return idx
+        idx += 1
+    return -1
+
+
+def _extract_join_segments(sql_text: str) -> List[str]:
+    segments: List[str] = []
+    from_idx = _find_top_level_keyword(sql_text, r"\bfrom\b")
+    if from_idx == -1:
+        return segments
+
+    cursor = from_idx
+    join_pat = r"\b(?:left|right|full|inner|cross)(?:\s+outer)?\s+join\b|\bjoin\b"
+    stop_pat = r"\bwhere\b|\bgroup\s+by\b|\border\s+by\b|;"
+
+    while True:
+        jidx = _find_top_level_keyword(sql_text, join_pat, cursor)
+        if jidx == -1:
+            break
+        next_join = _find_top_level_keyword(sql_text, join_pat, jidx + 1)
+        next_stop = _find_top_level_keyword(sql_text, stop_pat, jidx + 1)
+        end_candidates = [x for x in [next_join, next_stop] if x != -1]
+        end = min(end_candidates) if end_candidates else len(sql_text)
+        segment = sql_text[jidx:end].strip()
+        if segment:
+            segments.append(re.sub(r"\s+", " ", segment))
+        cursor = end
+
+    return segments
+
+
+def _parse_join_target(rest: str) -> Tuple[str, str, str]:
+    rest = rest.strip()
+    rest = re.sub(r"(?is)^/\*.*?\*/\s*", "", rest).strip()
+    rest = re.sub(r"(?im)^--.*?$", "", rest).strip()
+    if not rest:
+        return "RawJoin", "", ""
+
+    if rest.startswith("("):
+        depth = 0
+        end_idx = -1
+        for i, ch in enumerate(rest):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end_idx = i
+                    break
+        if end_idx == -1:
+            return "RawJoin", "", rest
+        after = rest[end_idx + 1 :].lstrip()
+        alias_m = re.match(r"([A-Za-z_]\w*)\b(.*)$", after, re.IGNORECASE)
+        if alias_m:
+            alias = alias_m.group(1)
+            return "Subquery", alias, alias_m.group(2).lstrip()
+        return "Subquery", "", after
+
+    token_m = re.match(r"([A-Za-z0-9_.$#]+)\b(.*)$", rest, re.IGNORECASE)
+    if not token_m:
+        return "RawJoin", "", rest
+    table_name = token_m.group(1)
+    after = token_m.group(2).lstrip()
+    alias_m = re.match(r"([A-Za-z_]\w*)\b(.*)$", after, re.IGNORECASE)
+    if alias_m and alias_m.group(1).lower() != "on":
+        return table_name, alias_m.group(1), alias_m.group(2).lstrip()
+    return table_name, "", after
 
 
 def parse_structured_joins(sql_text: str, alias_map: Dict[str, str]) -> List[JoinBlock]:
     joins: List[JoinBlock] = []
-    join_iter = list(
-        re.finditer(
-            r"(?is)\b(?P<jtype>left|right|full|inner|cross)?(?:\s+outer)?\s+join\s+(?P<table>[A-Za-z0-9_.$#()]+)(?:\s+(?P<alias>[A-Za-z_]\w*))?\s*(?P<tail>.*?)(?=\b(?:left|right|full|inner|cross)?(?:\s+outer)?\s+join\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|;|\Z)",
-            sql_text,
+    join_segments = _extract_join_segments(sql_text)
+    for raw_segment in join_segments:
+        jm = re.match(
+            r"(?is)(?P<jtype>(?:left|right|full|inner|cross)(?:\s+outer)?\s+join|join)\s+(?P<rest>.*)$",
+            raw_segment,
         )
-    )
-    for m in join_iter:
-        join_type = ((m.group("jtype") or "JOIN") + " JOIN").upper()
-        table_name = m.group("table").strip("()")
-        alias = (m.group("alias") or table_name).strip()
-        raw_segment = re.sub(r"\s+", " ", m.group(0)).strip()
-        on_m = re.search(r"(?is)\bon\b\s*(.+)$", m.group("tail").strip())
+        if not jm:
+            continue
+        join_type = jm.group("jtype").upper()
+        table_name, parsed_alias, tail = _parse_join_target(jm.group("rest"))
+        alias = parsed_alias or table_name
+
+        on_m = re.search(r"(?is)\bon\b\s*(.+)$", tail)
         join_condition = re.sub(r"\s+", " ", on_m.group(1)).strip() if on_m else raw_segment
+        if table_name == "RawJoin":
+            join_condition = raw_segment
+            alias = "RawJoin"
         resolved_condition = resolve_aliases(join_condition, alias_map)
         joins.append(
             JoinBlock(
