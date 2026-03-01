@@ -435,6 +435,27 @@ def parse_stages(text: str) -> List[Stage]:
     return parsed
 
 
+def extract_logic_notes(stage: Stage) -> List[str]:
+    notes: List[str] = []
+    for t in stage.transformations:
+        expr_l = t.expression.lower()
+        if "vehicle_sk=-99" in expr_l and "then" in expr_l:
+            note = "Vehicle SK fallback if source SK = -99"
+            if note not in notes:
+                notes.append(note)
+        if "supp_sk=-99" in expr_l and "'unknown'" in expr_l:
+            note = "SUPP_SK -99 mapped to Unknown"
+            if note not in notes:
+                notes.append(note)
+        if "supp_sk=-97" in expr_l and ("duplicates" in expr_l or "'duplicates'" in expr_l):
+            note = "SUPP_SK -97 mapped to Duplicates"
+            if note not in notes:
+                notes.append(note)
+    for c in stage.constraints:
+        notes.append(f"Constraint: {c.expression}")
+    return notes
+
+
 def classify_stage_role(stage: Stage) -> str:
     if stage.has_lookup:
         return "lookup"
@@ -613,11 +634,18 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
     target_chain: List[str] = []
     if yes_stage_name:
         target_chain.append(yes_stage_name)
-        for nxt, _ in downstream.get(yes_stage_name, []):
-            if nxt not in target_chain:
-                target_chain.append(nxt)
     if no_stage_name and no_stage_name not in target_chain:
         target_chain.append(no_stage_name)
+    # Include full downstream target flow (e.g., HF_FACT -> Ora_StgVehicleOffRoad).
+    q = list(target_chain)
+    seen = set(target_chain)
+    while q:
+        cur = q.pop(0)
+        for nxt, _ in downstream.get(cur, []):
+            if nxt not in seen:
+                seen.add(nxt)
+                q.append(nxt)
+                target_chain.append(nxt)
 
     success_stage_name = yes_stage_name
     exception_stage_name = no_stage_name
@@ -633,6 +661,16 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
             success_stage_name = yes_stage_name
             exception_stage_name = no_stage_name
 
+    source_note = f"Enriched via {max(len(source_stage.source_entities)-1, 0)} joins"
+    source_label = f"{source_stage.name}\\n({source_note})"
+
+    logic_notes = extract_logic_notes(transformer_stage)
+    transformer_lines = [transformer_stage.name]
+    for n in logic_notes[:3]:
+        transformer_lines.append(f"- {n}")
+
+    transformer_label = "\\n".join(transformer_lines)
+    transformer_label = "\\n".join(transformer_lines)
     lines = [
         f'digraph {sanitize_id(graph_name, "lineage_graph")} {{',
         "rankdir=LR;",
@@ -649,7 +687,7 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
         'label="Source Layer";',
         "style=dashed;",
         "color=grey;",
-        f'Source_DB [label="{dot_escape(source_stage.name)}", fillcolor="#FFD1DC"];',
+        f'Source_DB [label="{dot_escape(source_label)}", fillcolor="#FFD1DC"];',
         "}",
         "",
         "subgraph cluster_1 {",
@@ -668,7 +706,7 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
             "subgraph cluster_2 {",
             'label="Business Logic Stage";',
             "style=solid;",
-            f'Transformer [label="{dot_escape(transformer_stage.name)}", fillcolor="#FFF9C4"];',
+            f'Transformer [label="{dot_escape(transformer_label)}", fillcolor="#FFF9C4"];',
             "}",
             "",
             "subgraph cluster_3 {",
@@ -696,8 +734,13 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
     lines.append(f'Source_DB -> Transformer [label="{dot_escape(source_to_transform_link)}"];')
     for i, (_, link_name) in enumerate(lookup_links, 1):
         if i <= len(lookup_stages):
+            cond = ""
+            for t in transformer_stage.transformations:
+                if "vehicle_sk=-99" in t.expression.lower():
+                    cond = "\\n(If SK = -99)"
+                    break
             lines.append(
-                f'Lookup_{i} -> Transformer [label="{dot_escape(link_name)}", style=dotted];'
+                f'Lookup_{i} -> Transformer [label="{dot_escape(link_name + cond)}", style=dotted];'
             )
 
     if success_stage_name and success_stage_name in target_node_by_stage:
@@ -719,6 +762,12 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
         for dst_name, _ in downstream.get(src_name, []):
             if dst_name in target_node_by_stage:
                 lines.append(f"{src_node} -> {target_node_by_stage[dst_name]};")
+
+    # Footnote block in the left corner.
+    if logic_notes:
+        note_text = "Logic Fixes:\\n" + "\\n".join([f"{i+1}. {n}" for i, n in enumerate(logic_notes[:4])])
+        lines.append(f'Note1 [shape=plaintext, label="{dot_escape(note_text)}", fontsize=8];')
+        lines.append("Note1 -> Source_DB [style=invis];")
 
     lines.append("}")
     return "\n".join(lines)
@@ -802,6 +851,12 @@ def build_detailed_dot(
             success_stage_name = yes_stage_name
             exception_stage_name = no_stage_name
 
+    source_note = f"Enriched via {max(len(source_stage.source_entities)-1, 0)} joins"
+    source_label = f"{source_stage.name}\\n({source_note})"
+    logic_notes = extract_logic_notes(transformer_stage)
+    transformer_lines = [transformer_stage.name] + [f"- {n}" for n in logic_notes[:3]]
+    transformer_label = "\\n".join(transformer_lines)
+
     lines = [
         f'digraph {sanitize_id(graph_name + "_detailed", "lineage_detailed")} {{',
         "rankdir=LR;",
@@ -818,7 +873,7 @@ def build_detailed_dot(
         'label="Source Layer";',
         "style=dashed;",
         "color=grey;",
-        f'Source_DB [label="{dot_escape(source_stage.name)}", fillcolor="#FFD1DC"];',
+        f'Source_DB [label="{dot_escape(source_label)}", fillcolor="#FFD1DC"];',
     ]
     for i, (entity, rel) in enumerate(source_stage.source_entities, 1):
         src_ent_id = f"SourceEnt_{i}"
@@ -844,7 +899,7 @@ def build_detailed_dot(
             'label="Business Logic Stage";',
             "style=solid;",
             "color=black;",
-            f'Transformer [label="{dot_escape(transformer_stage.name)}", fillcolor="#FFF9C4"];',
+            f'Transformer [label="{dot_escape(transformer_label)}", fillcolor="#FFF9C4"];',
         ]
     )
 
@@ -923,8 +978,22 @@ def build_detailed_dot(
     )
 
     target_nodes: Dict[str, str] = {}
+    target_order: List[str] = []
+    for n in [success_stage_name, exception_stage_name]:
+        if n and n not in target_order:
+            target_order.append(n)
+    q = list(target_order)
+    seen = set(target_order)
+    while q:
+        cur = q.pop(0)
+        for nxt, _ in downstream.get(cur, []):
+            if nxt not in seen:
+                seen.add(nxt)
+                q.append(nxt)
+                target_order.append(nxt)
+
     t_idx = 1
-    for name in [success_stage_name, exception_stage_name]:
+    for name in target_order:
         if not name or name in target_nodes:
             continue
         stage = stage_by_name.get(name)
@@ -944,7 +1013,12 @@ def build_detailed_dot(
     lines.append(f'Source_DB -> Transformer [label="{dot_escape(source_to_transform_link)}"];')
     for i, (_, link_name) in enumerate(lookup_links, 1):
         if i <= len(lookup_stages):
-            lines.append(f'Lookup_{i} -> Transformer [style=dashed, label="Lookup: {dot_escape(link_name)}"];')
+            cond = ""
+            for t in transformer_stage.transformations:
+                if "vehicle_sk=-99" in t.expression.lower():
+                    cond = "\\n(If SK = -99)"
+                    break
+            lines.append(f'Lookup_{i} -> Transformer [style=dashed, label="Lookup: {dot_escape(link_name + cond)}"];')
 
     for idx, jb in enumerate(source_stage.join_blocks, 1):
         cond = jb.join_condition if jb.table_name in {"Subquery", "RawJoin"} else (jb.resolved_condition or jb.raw_join)
@@ -974,6 +1048,11 @@ def build_detailed_dot(
         for dst_name, _ in downstream.get(src_name, []):
             if dst_name in target_nodes:
                 lines.append(f"{src_node} -> {target_nodes[dst_name]} [label=\"Transformation\"];")
+
+    if logic_notes:
+        note_text = "Logic Fixes:\\n" + "\\n".join([f"{i+1}. {n}" for i, n in enumerate(logic_notes[:4])])
+        lines.append(f'Note1 [shape=plaintext, label="{dot_escape(note_text)}", fontsize=8];')
+        lines.append("Note1 -> Source_DB [style=invis];")
 
     lines.append("}")
     return "\n".join(lines)
@@ -1038,13 +1117,18 @@ def process_file(file_path: str, file_name: str) -> None:
 
             high_dot_path = os.path.join(OUTPUT_FOLDER, f"{base}_high_level.dot")
             detailed_dot_path = os.path.join(OUTPUT_FOLDER, f"{base}_detailed.dot")
+            hybrid_dot_path = os.path.join(OUTPUT_FOLDER, f"{base}_hybrid.dot")
             with open(high_dot_path, "w", encoding="utf-8") as f:
                 f.write(high_dot)
             with open(detailed_dot_path, "w", encoding="utf-8") as f:
                 f.write(detailed_dot)
+            # Hybrid output uses the detailed architecture-style DOT as requested.
+            with open(hybrid_dot_path, "w", encoding="utf-8") as f:
+                f.write(detailed_dot)
 
             render_pdf(high_dot, os.path.join(OUTPUT_FOLDER, f"{base}_high_level"))
             render_pdf(detailed_dot, os.path.join(OUTPUT_FOLDER, f"{base}_detailed"))
+            render_pdf(detailed_dot, os.path.join(OUTPUT_FOLDER, f"{base}_hybrid"))
         except ExecutableNotFound:
             print("[WARN] Graphviz 'dot' executable not found. Install Graphviz and add it to PATH to generate PDF.")
         except Exception as ex:
