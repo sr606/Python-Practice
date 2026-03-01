@@ -2,6 +2,8 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
+from graphviz import Source
+from graphviz.backend import ExecutableNotFound
 
 
 INPUT_FOLDER = "data/input"
@@ -530,6 +532,18 @@ def extract_lineage(text: str, file_name: str) -> str:
     )
 
 
+def extract_dot_sections(contract_output: str) -> Tuple[str, str]:
+    high_match = re.search(r"(?s)HIGH LEVEL DOT\s*(digraph.*?)(?=\nDETAILED DOT\b)", contract_output)
+    detailed_match = re.search(r"(?s)DETAILED DOT\s*(digraph.*?)(?=\nEND_OUTPUT\b)", contract_output)
+    if not high_match or not detailed_match:
+        raise ValueError("DOT sections missing from output contract.")
+    return high_match.group(1).strip(), detailed_match.group(1).strip()
+
+
+def render_pdf(dot_code: str, output_stem: str) -> None:
+    Source(dot_code).render(output_stem, format="pdf", cleanup=True)
+
+
 def process_file(file_path: str, file_name: str) -> None:
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         pseudo = f.read()
@@ -538,6 +552,25 @@ def process_file(file_path: str, file_name: str) -> None:
     output_path = os.path.join(OUTPUT_FOLDER, f"{base}.dot.txt")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(output)
+
+    if output.startswith("BEGIN_OUTPUT"):
+        try:
+            high_dot, detailed_dot = extract_dot_sections(output)
+
+            high_dot_path = os.path.join(OUTPUT_FOLDER, f"{base}_high_level.dot")
+            detailed_dot_path = os.path.join(OUTPUT_FOLDER, f"{base}_detailed.dot")
+            with open(high_dot_path, "w", encoding="utf-8") as f:
+                f.write(high_dot)
+            with open(detailed_dot_path, "w", encoding="utf-8") as f:
+                f.write(detailed_dot)
+
+            render_pdf(high_dot, os.path.join(OUTPUT_FOLDER, f"{base}_high_level"))
+            render_pdf(detailed_dot, os.path.join(OUTPUT_FOLDER, f"{base}_detailed"))
+        except ExecutableNotFound:
+            print("[WARN] Graphviz 'dot' executable not found. Install Graphviz and add it to PATH to generate PDF.")
+        except Exception as ex:
+            print(f"[WARN] PDF render failed: {ex}")
+
     print(f"Processed {file_name} -> {output_path}")
 
 
