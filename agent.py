@@ -27,6 +27,16 @@ class Constraint:
 
 
 @dataclass
+class JoinBlock:
+    join_type: str
+    table_name: str
+    alias: str
+    raw_join: str
+    join_condition: str
+    resolved_condition: str
+
+
+@dataclass
 class Stage:
     raw_header: str
     name: str
@@ -38,7 +48,9 @@ class Stage:
     constraints: List[Constraint] = field(default_factory=list)
     stage_vars_defined: Dict[str, str] = field(default_factory=dict)
     stage_vars_used: List[str] = field(default_factory=list)
-    join_conditions: List[str] = field(default_factory=list)
+    output_links: List[str] = field(default_factory=list)
+    alias_map: Dict[str, str] = field(default_factory=dict)
+    join_blocks: List[JoinBlock] = field(default_factory=list)
     has_explicit_join_stage: bool = False
     has_lookup: bool = False
 
@@ -139,15 +151,16 @@ def is_direct_copy(expr: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z_]\w*\.[A-Za-z_]\w*", expr))
 
 
-def parse_transformations(block: str) -> List[Transformation]:
+def parse_transformations(block: str) -> Tuple[List[Transformation], List[str]]:
     out: List[Transformation] = []
+    output_links: List[str] = []
     match = re.search(
         r"(?is)Transformations:\s*(.*?)(?=^\s*(Output:\s*|//\s*---|\Z))",
         block,
         re.MULTILINE,
     )
     if not match:
-        return out
+        return out, output_links
 
     current_output = "Unknown"
     lines = [ln.rstrip() for ln in match.group(1).splitlines() if ln.strip()]
@@ -155,6 +168,8 @@ def parse_transformations(block: str) -> List[Transformation]:
         marker = re.match(r"\s*--\s*Output:\s*(.*?)\s*--\s*$", line, re.IGNORECASE)
         if marker:
             current_output = marker.group(1).strip() or "Unknown"
+            if current_output not in output_links:
+                output_links.append(current_output)
             continue
         m = re.match(r"\s*([A-Za-z_]\w*)\s*=\s*(.+)$", line)
         if m:
@@ -178,22 +193,66 @@ def parse_transformations(block: str) -> List[Transformation]:
                     issue="Unresolved Mapping",
                 )
             )
-    return out
+    return out, output_links
 
 
-def parse_joins(sql_text: str) -> List[str]:
-    joins = []
-    for m in re.finditer(
-        r"(?is)\b(?:left|right|full|inner|outer|cross)?\s*join\b(.*?)(?=\b(?:left|right|full|inner|outer|cross)?\s*join\b|\border\s+by\b|\bwhere\b|\bgroup\s+by\b|;|\Z)",
+def extract_from_block(sql_text: str) -> str:
+    m = re.search(
+        r"(?is)\bfrom\b\s*(.*?)(?=\b(?:left|right|full|inner|outer|cross)?\s*join\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|;|\Z)",
         sql_text,
-    ):
-        segment = m.group(0).strip()
-        on_m = re.search(r"(?is)\bon\b\s*(.+)", segment)
-        if on_m:
-            cond = re.sub(r"\s+", " ", on_m.group(1)).strip()
-            joins.append(cond if cond else "Join condition unknown")
-        else:
-            joins.append("Join condition unknown")
+    )
+    return m.group(1).strip() if m else ""
+
+
+def build_alias_map(sql_text: str) -> Dict[str, str]:
+    alias_map: Dict[str, str] = {}
+    from_block = extract_from_block(sql_text)
+    if from_block:
+        m = re.match(r"(?is)([A-Za-z0-9_.$#]+)\s+([A-Za-z_]\w*)\b", from_block)
+        if m:
+            alias_map[m.group(2)] = m.group(1)
+
+    join_pattern = re.compile(
+        r"(?is)\b(?:left|right|full|inner|outer|cross)?\s*join\s+([A-Za-z0-9_.$#()]+)\s+([A-Za-z_]\w*)\b"
+    )
+    for m in join_pattern.finditer(sql_text):
+        alias_map[m.group(2)] = m.group(1).strip("()")
+    return alias_map
+
+
+def resolve_aliases(expr: str, alias_map: Dict[str, str]) -> str:
+    resolved = expr
+    for alias, table in sorted(alias_map.items(), key=lambda x: len(x[0]), reverse=True):
+        resolved = re.sub(rf"\b{re.escape(alias)}\.", f"{table}.", resolved)
+    return resolved
+
+
+def parse_structured_joins(sql_text: str, alias_map: Dict[str, str]) -> List[JoinBlock]:
+    joins: List[JoinBlock] = []
+    join_iter = list(
+        re.finditer(
+            r"(?is)\b(?P<jtype>left|right|full|inner|cross)?(?:\s+outer)?\s+join\s+(?P<table>[A-Za-z0-9_.$#()]+)(?:\s+(?P<alias>[A-Za-z_]\w*))?\s*(?P<tail>.*?)(?=\b(?:left|right|full|inner|cross)?(?:\s+outer)?\s+join\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|;|\Z)",
+            sql_text,
+        )
+    )
+    for m in join_iter:
+        join_type = ((m.group("jtype") or "JOIN") + " JOIN").upper()
+        table_name = m.group("table").strip("()")
+        alias = (m.group("alias") or table_name).strip()
+        raw_segment = re.sub(r"\s+", " ", m.group(0)).strip()
+        on_m = re.search(r"(?is)\bon\b\s*(.+)$", m.group("tail").strip())
+        join_condition = re.sub(r"\s+", " ", on_m.group(1)).strip() if on_m else raw_segment
+        resolved_condition = resolve_aliases(join_condition, alias_map)
+        joins.append(
+            JoinBlock(
+                join_type=join_type,
+                table_name=table_name,
+                alias=alias,
+                raw_join=raw_segment,
+                join_condition=join_condition,
+                resolved_condition=resolved_condition,
+            )
+        )
     return joins
 
 
@@ -210,6 +269,10 @@ def parse_stages(text: str) -> List[Stage]:
         )
         sql_text = sql_match.group(1).strip() if sql_match else ""
 
+        transformations, output_links = parse_transformations(block)
+        alias_map = build_alias_map(sql_text)
+        join_blocks = parse_structured_joins(sql_text, alias_map)
+
         stage = Stage(
             raw_header=header,
             name=name,
@@ -217,10 +280,12 @@ def parse_stages(text: str) -> List[Stage]:
             block=block,
             inputs=parse_inputs(block),
             outputs=parse_outputs(block),
-            transformations=parse_transformations(block),
+            transformations=transformations,
             constraints=parse_constraints(block),
             stage_vars_defined=parse_stage_variables(block),
-            join_conditions=parse_joins(sql_text),
+            output_links=output_links,
+            alias_map=alias_map,
+            join_blocks=join_blocks,
             has_explicit_join_stage=("join" in stage_type.lower()),
             has_lookup=("lookup" in stage_type.lower() and re.search(r"\breference\b", block, re.IGNORECASE) is not None),
         )
@@ -304,7 +369,7 @@ def build_global_links(stages: List[Stage]) -> List[Tuple[str, str, str]]:
 
 def compute_complexity(stages: List[Stage]) -> Tuple[int, int]:
     stage_count = len(stages)
-    join_count = sum(len(s.join_conditions) + (1 if s.has_explicit_join_stage else 0) for s in stages)
+    join_count = sum(len(s.join_blocks) + (1 if s.has_explicit_join_stage else 0) for s in stages)
     transformation_count = sum(1 for s in stages for t in s.transformations if t.is_modified)
     constraint_count = sum(len(s.constraints) for s in stages)
     transformed_columns = sum(1 for s in stages for t in s.transformations if t.is_modified)
@@ -323,6 +388,24 @@ def node_shape(stage: Stage) -> str:
     if "join" in stype:
         return "box"
     return "box"
+
+
+def get_constraint_routes(stage: Stage, constraint_name: str) -> Tuple[str, str]:
+    # Prefer transformation output link names for route targets.
+    explicit_outputs = [o for o in stage.output_links if o and o != "Unknown"]
+    if explicit_outputs:
+        yes_target = constraint_name if constraint_name in explicit_outputs else explicit_outputs[0]
+        no_candidates = [o for o in explicit_outputs if o != yes_target]
+        no_target = no_candidates[0] if no_candidates else "Unknown"
+        return yes_target, no_target
+
+    # Fallback to stage dataset outputs if no transformation link labels are present.
+    ds_outputs = [name for _, name in stage.outputs]
+    if ds_outputs:
+        yes_target = ds_outputs[0]
+        no_target = ds_outputs[1] if len(ds_outputs) > 1 else "Unknown"
+        return yes_target, no_target
+    return "Unknown", "Unknown"
 
 
 def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, links: List[Tuple[str, str, str]]) -> str:
@@ -414,10 +497,12 @@ def build_detailed_dot(
         sid = node_ids[s.name]
         if s.has_lookup:
             lines.append(f'{sid} -> {sid} [style=dashed, label="Lookup"];')
-        for idx, jc in enumerate(s.join_conditions, 1):
+        for idx, jb in enumerate(s.join_blocks, 1):
             jnid = f"{sid}_join_{idx}"
-            lines.append(f'{jnid} [label="Join", shape=box];')
-            lines.append(f'{sid} -> {jnid} [label="Join: {dot_escape(jc or "Join condition unknown")}"];')
+            join_label = f"{jb.join_type} {jb.table_name} as {jb.alias}"
+            lines.append(f'{jnid} [label="{dot_escape(join_label)}", shape=box];')
+            cond = jb.resolved_condition if jb.resolved_condition else jb.raw_join
+            lines.append(f'{sid} -> {jnid} [label="Join: {dot_escape(cond)}"];')
         for cidx, c in enumerate(s.constraints, 1):
             cnid = f"{sid}_constraint_{cidx}"
             expr = c.expression
@@ -429,25 +514,42 @@ def build_detailed_dot(
                 lines.append(f'{cnid} [label="{dot_escape(expr)}", shape=diamond];')
                 lines.append(f'{sid} -> {cnid} [label="Constraint"];')
 
-            yes_target = "Unknown"
-            no_target = "Unknown"
-            for _, _, link_name in s.inputs:
-                if c.name == link_name:
-                    yes_target = s.name
-            lines.append(f'{cnid} -> {sanitize_id(yes_target, "Unknown")} [label="Yes"];')
-            if yes_target == "Unknown":
-                lines.append('Unknown [label="Unknown", shape=cylinder];')
-            lines.append(f'{cnid} -> {sanitize_id(no_target, "Unknown")} [label="No"];')
+            yes_target, no_target = get_constraint_routes(s, c.name)
+            yes_id = f"{sid}_out_yes_{sanitize_id(yes_target, 'Unknown')}"
+            no_id = f"{sid}_out_no_{sanitize_id(no_target, 'Unknown')}"
+            lines.append(f'{yes_id} [label="Output: {dot_escape(yes_target)}", shape=box];')
+            lines.append(f'{no_id} [label="Output: {dot_escape(no_target)}", shape=box];')
+            lines.append(f'{cnid} -> {yes_id} [label="Yes"];')
+            lines.append(f'{cnid} -> {no_id} [label="No"];')
 
             if c.issue:
                 issue_id = f"{cnid}_issue"
                 lines.append(f'{issue_id} [label="{dot_escape(c.issue)}", shape=diamond];')
                 lines.append(f'{cnid} -> {issue_id} [label="Constraint"];')
 
-        if transformed_columns > 25:
-            count = sum(1 for t in s.transformations if t.is_modified)
-            if count > 0:
-                lines.append(f'{sid} -> {sid} [label="Multiple column transformations ({count})"];')
+        mapped_count = sum(1 for t in s.transformations if t.target_col != "Unknown")
+        modified_count = sum(1 for t in s.transformations if t.is_modified)
+        if mapped_count > 15:
+            summary_id = f"{sid}_summary"
+            lines.append(f'{summary_id} [label="{dot_escape(s.name)} ({mapped_count} columns mapped)", shape=box];')
+            lines.append(f'{sid} -> {summary_id} [label="Transformation"];')
+            unique_expr: Dict[str, List[str]] = {}
+            for t in s.transformations:
+                if t.is_modified:
+                    unique_expr.setdefault(t.expression, []).append(t.target_col)
+            for eidx, (expr, cols) in enumerate(unique_expr.items(), 1):
+                expr_node = f"{sid}_expr_{eidx}"
+                lines.append(f'{expr_node} [label="Applied to {len(cols)} columns", shape=box];')
+                edge_label = expr if len(expr) <= 140 else (expr[:137] + "...")
+                lines.append(f'{summary_id} -> {expr_node} [label="Transformation: {dot_escape(edge_label)}"];')
+            direct_copy_count = mapped_count - modified_count
+            if direct_copy_count > 0:
+                copy_node = f"{sid}_direct_copy_summary"
+                lines.append(f'{copy_node} [label="Direct copies: {direct_copy_count}", shape=box];')
+                lines.append(f'{summary_id} -> {copy_node} [label="Transformation: Direct copy mappings"];')
+        elif transformed_columns > 25:
+            if modified_count > 0:
+                lines.append(f'{sid} -> {sid} [label="Multiple column transformations ({modified_count})"];')
         else:
             unique_expr: Dict[str, List[str]] = {}
             unresolved_count = 0
@@ -486,15 +588,24 @@ def build_detailed_dot(
                 lines.append(f'{sid} -> {um_id} [label="Transformation"];')
 
         defined = set(s.stage_vars_defined.keys())
+        constraint_ids: Dict[str, str] = {}
+        for cidx, c in enumerate(s.constraints, 1):
+            constraint_ids[c.expression] = f"{sid}_constraint_{cidx}"
         for sv in s.stage_vars_used:
             if sv in defined:
                 vid = f"{sid}_{sanitize_id(sv, 'sv')}"
                 lines.append(f'{vid} [label="{dot_escape(sv)}", shape=ellipse];')
-                lines.append(f'{vid} -> {sid} [label="Transformation"];')
+                lines.append(f'{vid} -> {sid} [label="Stage Variable"];')
+                for c in s.constraints:
+                    if re.search(rf"\b{re.escape(sv)}\b", c.expression):
+                        lines.append(f'{vid} -> {constraint_ids[c.expression]} [label="Constraint"];')
             else:
                 vid = f"{sid}_{sanitize_id(sv, 'sv')}_undef"
                 lines.append(f'{vid} [label="Undefined Variable", shape=ellipse];')
-                lines.append(f'{vid} -> {sid} [label="Transformation"];')
+                lines.append(f'{vid} -> {sid} [label="Stage Variable"];')
+                for c in s.constraints:
+                    if re.search(rf"\b{re.escape(sv)}\b", c.expression):
+                        lines.append(f'{vid} -> {constraint_ids[c.expression]} [label="Constraint"];')
 
     lines.append("}")
     return "\n".join(lines)
