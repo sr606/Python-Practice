@@ -731,150 +731,249 @@ def build_detailed_dot(
     links: List[Tuple[str, str, str]],
     transformed_columns: int,
 ) -> str:
-    node_ids = {s.name: sanitize_id(s.name, f"stage_{i}") for i, s in enumerate(stages, 1)}
+    stage_by_name = {s.name: s for s in stages}
+    downstream: Dict[str, List[Tuple[str, str]]] = {}
+    for src, dst, lbl in links:
+        downstream.setdefault(src, []).append((dst, lbl))
+
+    transformer_stage = next(
+        (s for s in stages if "transformer" in s.stage_type.lower() or s.name.lower().startswith("tfm_")),
+        next((s for s in stages if classify_stage_role(s) == "processing"), stages[0]),
+    )
+    source_stage = next(
+        (s for s in stages if classify_stage_role(s) == "source" and s.name != "HF_SMR_VEHICLE_DIM"),
+        next((s for s in stages if classify_stage_role(s) == "source"), transformer_stage),
+    )
+
+    input_link_to_stage: Dict[str, str] = {}
+    for s in stages:
+        for _, _, link_name in s.inputs:
+            if link_name:
+                input_link_to_stage[link_name] = s.name
+
+    lookup_stage_names = set()
+    source_to_transform_link = "Unknown"
+    lookup_links: List[Tuple[str, str]] = []
+    for _, _, link_name in transformer_stage.inputs:
+        producer_name = None
+        for src, dst, lbl in links:
+            if dst == transformer_stage.name and lbl:
+                producer_name = src
+        if link_name and link_name.lower().startswith("lk"):
+            if producer_name and producer_name in stage_by_name:
+                lookup_stage_names.add(producer_name)
+                lookup_links.append((producer_name, link_name))
+            continue
+        if link_name and source_to_transform_link == "Unknown":
+            source_to_transform_link = link_name
+
+    for s in stages:
+        if s.has_lookup:
+            lookup_stage_names.add(s.name)
+    lookup_stages = [stage_by_name[n] for n in lookup_stage_names if n in stage_by_name and n != transformer_stage.name]
+
+    yes_stage_name = None
+    no_stage_name = None
+    constraint_expr = ""
+    if transformer_stage.constraints:
+        c = transformer_stage.constraints[0]
+        constraint_expr = c.expression
+        yes_out, no_out = get_constraint_routes(transformer_stage, c.name)
+        yes_stage_name = input_link_to_stage.get(yes_out)
+        no_stage_name = input_link_to_stage.get(no_out)
+
+    transformer_children = [dst for dst, _ in downstream.get(transformer_stage.name, [])]
+    if not yes_stage_name and transformer_children:
+        yes_stage_name = transformer_children[0]
+    if not no_stage_name and len(transformer_children) > 1:
+        no_stage_name = transformer_children[1]
+
+    success_stage_name = yes_stage_name
+    exception_stage_name = no_stage_name
+    if yes_stage_name and no_stage_name:
+        yes_stage = stage_by_name.get(yes_stage_name)
+        no_stage = stage_by_name.get(no_stage_name)
+        yes_is_exception = yes_stage and ("seqfile" in yes_stage.stage_type.lower() or "exception" in yes_stage.name.lower())
+        no_is_exception = no_stage and ("seqfile" in no_stage.stage_type.lower() or "exception" in no_stage.name.lower())
+        if yes_is_exception and not no_is_exception:
+            success_stage_name = no_stage_name
+            exception_stage_name = yes_stage_name
+        elif no_is_exception and not yes_is_exception:
+            success_stage_name = yes_stage_name
+            exception_stage_name = no_stage_name
+
     lines = [
         f'digraph {sanitize_id(graph_name + "_detailed", "lineage_detailed")} {{',
-        f"rankdir={rankdir};",
+        "rankdir=LR;",
+        "nodesep=0.5;",
+        "ranksep=1.0;",
         'fontsize=10;',
         'fontname="Arial";',
-        'node [fontname="Arial"];',
-        'edge [fontname="Arial"];',
+        f'label="{dot_escape(graph_name)} Detailed Lineage Diagram";',
+        'labelloc="t";',
+        'node [shape=box, style="filled", fontname="Arial", fontsize=10];',
+        'edge [fontname="Arial", fontsize=8];',
+        "",
+        "subgraph cluster_0 {",
+        'label="Source Layer";',
+        "style=dashed;",
+        "color=grey;",
+        f'Source_DB [label="{dot_escape(source_stage.name)}", fillcolor="#FFD1DC"];',
     ]
+    for i, (entity, rel) in enumerate(source_stage.source_entities, 1):
+        src_ent_id = f"SourceEnt_{i}"
+        lines.append(f'{src_ent_id} [label="{dot_escape(entity)}", shape=cylinder, fillcolor="#F8D7DA"];')
+        lines.append(f'{src_ent_id} -> Source_DB [label="{dot_escape(rel)}"];')
+    lines.extend(
+        [
+            "}",
+            "",
+            "subgraph cluster_1 {",
+            'label="Reference Data";',
+            "style=dashed;",
+            "color=blue;",
+        ]
+    )
+    for i, lk in enumerate(lookup_stages, 1):
+        lines.append(f'Lookup_{i} [label="{dot_escape(lk.name)}", fillcolor="#E1F5FE", shape=cylinder];')
+    lines.extend(
+        [
+            "}",
+            "",
+            "subgraph cluster_2 {",
+            'label="Business Logic Stage";',
+            "style=solid;",
+            "color=black;",
+            f'Transformer [label="{dot_escape(transformer_stage.name)}", fillcolor="#FFF9C4"];',
+        ]
+    )
 
-    for s in stages:
-        lines.append(f'{node_ids[s.name]} [label="{dot_escape(s.name)}", shape={node_shape(s)}];')
+    # Join blocks
+    for idx, jb in enumerate(source_stage.join_blocks, 1):
+        table_label = jb.table_name
+        alias_label = jb.alias
+        if table_label in {"Subquery", "RawJoin"}:
+            table_label = "Subquery" if table_label == "Subquery" else "Join Block"
+        if alias_label in {"Subquery", "RawJoin", "Unknown"}:
+            alias_label = ""
+        join_label = f"{jb.join_type} {table_label}".strip()
+        if alias_label:
+            join_label = f"{join_label} as {alias_label}"
+        jnid = f"Join_{idx}"
+        lines.append(f'{jnid} [label="{dot_escape(join_label)}", fillcolor="#FFE6CC"];')
 
-    for src, dst, dataset in links:
-        src_id = node_ids.get(src, "Unknown")
-        dst_id = node_ids.get(dst, "Unknown")
-        if src_id == "Unknown":
-            lines.append('Unknown [label="Unknown", shape=cylinder];')
-        lines.append(f'{src_id} -> {dst_id} [label="Transformation: {dot_escape(dataset)}"];')
-
-    for s in stages:
-        sid = node_ids[s.name]
-        if s.has_lookup:
-            lines.append(f'{sid} -> {sid} [style=dashed, label="Lookup"];')
-        for idx, jb in enumerate(s.join_blocks, 1):
-            jnid = f"{sid}_join_{idx}"
-            table_label = jb.table_name
-            alias_label = jb.alias
-            if table_label in {"Subquery", "RawJoin"}:
-                table_label = "Subquery" if table_label == "Subquery" else "Join Block"
-            if alias_label in {"Subquery", "RawJoin", "Unknown"}:
-                alias_label = ""
-            join_label = f"{jb.join_type} {table_label}".strip()
-            if alias_label:
-                join_label = f"{join_label} as {alias_label}"
-            lines.append(f'{jnid} [label="{dot_escape(join_label)}", shape=box];')
-            if jb.table_name in {"Subquery", "RawJoin"}:
-                cond = jb.join_condition if jb.join_condition else jb.raw_join
-            else:
-                cond = jb.resolved_condition if jb.resolved_condition else jb.raw_join
-            lines.append(f'{sid} -> {jnid} [label="Join: {dot_escape(cond)}"];')
-        for cidx, c in enumerate(s.constraints, 1):
-            cnid = f"{sid}_constraint_{cidx}"
-            expr = c.expression
-            if len(expr) > 140:
-                truncated = expr[:137] + "..."
-                lines.append(f'{cnid} [label="{dot_escape(truncated)}", shape=diamond];')
-                lines.append(f'{sid} -> {cnid} [label="Constraint: {dot_escape(expr)}"];')
-            else:
-                lines.append(f'{cnid} [label="{dot_escape(expr)}", shape=diamond];')
-                lines.append(f'{sid} -> {cnid} [label="Constraint"];')
-
-            yes_target, no_target = get_constraint_routes(s, c.name)
-            yes_id = f"{sid}_out_yes_{sanitize_id(yes_target, 'Unknown')}"
-            no_id = f"{sid}_out_no_{sanitize_id(no_target, 'Unknown')}"
-            lines.append(f'{yes_id} [label="Output: {dot_escape(yes_target)}", shape=box];')
-            lines.append(f'{no_id} [label="Output: {dot_escape(no_target)}", shape=box];')
-            lines.append(f'{cnid} -> {yes_id} [label="Yes"];')
-            lines.append(f'{cnid} -> {no_id} [label="No"];')
-
-            if c.issue:
-                issue_id = f"{cnid}_issue"
-                lines.append(f'{issue_id} [label="{dot_escape(c.issue)}", shape=diamond];')
-                lines.append(f'{cnid} -> {issue_id} [label="Constraint"];')
-
-        mapped_count = sum(1 for t in s.transformations if t.target_col != "Unknown")
-        modified_count = sum(1 for t in s.transformations if t.is_modified)
-        if mapped_count > 15:
-            summary_id = f"{sid}_summary"
-            lines.append(f'{summary_id} [label="{dot_escape(s.name)} ({mapped_count} columns mapped)", shape=box];')
-            lines.append(f'{sid} -> {summary_id} [label="Transformation"];')
-            unique_expr: Dict[str, List[str]] = {}
-            for t in s.transformations:
-                if t.is_modified:
-                    unique_expr.setdefault(t.expression, []).append(t.target_col)
-            for eidx, (expr, cols) in enumerate(unique_expr.items(), 1):
-                expr_node = f"{sid}_expr_{eidx}"
-                lines.append(f'{expr_node} [label="Applied to {len(cols)} columns", shape=box];')
-                edge_label = expr if len(expr) <= 140 else (expr[:137] + "...")
-                lines.append(f'{summary_id} -> {expr_node} [label="Transformation: {dot_escape(edge_label)}"];')
-            direct_copy_count = mapped_count - modified_count
-            if direct_copy_count > 0:
-                copy_node = f"{sid}_direct_copy_summary"
-                lines.append(f'{copy_node} [label="Direct copies: {direct_copy_count}", shape=box];')
-                lines.append(f'{summary_id} -> {copy_node} [label="Transformation: Direct copy mappings"];')
-        elif transformed_columns > 25:
-            if modified_count > 0:
-                lines.append(f'{sid} -> {sid} [label="Multiple column transformations ({modified_count})"];')
+    # Stage vars
+    for idx, sv in enumerate(transformer_stage.stage_vars_used, 1):
+        vid = f"SV_{idx}"
+        if sv in transformer_stage.stage_vars_defined:
+            lines.append(f'{vid} [label="{dot_escape(sv)}", shape=ellipse, fillcolor="#E8DAEF"];')
         else:
-            unique_expr: Dict[str, List[str]] = {}
-            unresolved_count = 0
-            for t in s.transformations:
-                if t.issue == "Unresolved Mapping":
-                    unresolved_count += 1
-                if not t.is_modified:
-                    continue
+            lines.append(f'{vid} [label="Undefined Variable", shape=ellipse, fillcolor="#F5B7B1"];')
+
+    # Constraints
+    for cidx, c in enumerate(transformer_stage.constraints, 1):
+        cnid = f"Constraint_{cidx}"
+        expr = c.expression if len(c.expression) <= 140 else c.expression[:137] + "..."
+        lines.append(f'{cnid} [label="{dot_escape(expr)}", shape=diamond, fillcolor="#FADBD8"];')
+
+    # Mappings
+    mapped_count = sum(1 for t in transformer_stage.transformations if t.target_col != "Unknown")
+    modified_count = sum(1 for t in transformer_stage.transformations if t.is_modified)
+    if mapped_count > 15:
+        lines.append(
+            f'MapSummary [label="{dot_escape(transformer_stage.name)} ({mapped_count} columns mapped)", fillcolor="#FCF3CF"];'
+        )
+        unique_expr: Dict[str, List[str]] = {}
+        for t in transformer_stage.transformations:
+            if t.is_modified:
                 unique_expr.setdefault(t.expression, []).append(t.target_col)
+        for eidx, (expr, cols) in enumerate(unique_expr.items(), 1):
+            enid = f"Expr_{eidx}"
+            edge_label = expr if len(expr) <= 140 else (expr[:137] + "...")
+            lines.append(f'{enid} [label="Applied to {len(cols)} columns", fillcolor="#FEF9E7"];')
+            lines.append(f'MapSummary -> {enid} [label="Transformation: {dot_escape(edge_label)}"];')
+        direct_copy_count = mapped_count - modified_count
+        if direct_copy_count > 0:
+            lines.append(f'DirectCopy [label="Direct copies: {direct_copy_count}", fillcolor="#FEF9E7"];')
+            lines.append('MapSummary -> DirectCopy [label="Transformation: Direct copy mappings"];')
+    elif transformed_columns > 25 and modified_count > 0:
+        lines.append(
+            f'MapSummary [label="Multiple column transformations ({modified_count})", fillcolor="#FCF3CF"];'
+        )
+    else:
+        unique_expr: Dict[str, List[str]] = {}
+        for t in transformer_stage.transformations:
+            if t.is_modified:
+                unique_expr.setdefault(t.expression, []).append(t.target_col)
+        for eidx, (expr, cols) in enumerate(unique_expr.items(), 1):
+            mnid = f"Map_{eidx}"
+            edge_label = expr if len(expr) <= 140 else (expr[:137] + "...")
+            lines.append(f'{mnid} [label="Applied to {len(cols)} columns", fillcolor="#FCF3CF"];')
+            lines.append(f'Transformer -> {mnid} [label="Transformation: {dot_escape(edge_label)}"];')
 
-            for eidx, (expr, cols) in enumerate(unique_expr.items(), 1):
-                mid = f"{sid}_map_{eidx}"
-                if len(cols) > 1:
-                    target_label = f"Applied to {len(cols)} columns"
-                elif len(s.transformations) <= 8:
-                    target_label = f"{s.name}|{cols[0]}"
-                else:
-                    target_label = f"{s.name} ({len(s.transformations)} columns transformed)"
-                shape = "record" if len(s.transformations) <= 8 else "box"
-                if len(expr) > 140:
-                    lines.append(f'{mid} [label="{dot_escape(target_label)}", shape={shape}];')
-                    lines.append(f'{sid} -> {mid} [label="Transformation: {dot_escape(expr)}"];')
-                else:
-                    edge_label = expr if len(cols) == 1 else f"Applied to {len(cols)} columns"
-                    lines.append(f'{mid} [label="{dot_escape(target_label)}", shape={shape}];')
-                    lines.append(f'{sid} -> {mid} [label="Transformation: {dot_escape(edge_label)}"];')
+    lines.extend(
+        [
+            "}",
+            "",
+            "subgraph cluster_3 {",
+            'label="Target Layer";',
+            "style=dashed;",
+            "color=green;",
+        ]
+    )
 
-            for t in s.transformations:
-                if t.issue and t.issue != "Unresolved Mapping":
-                    issue_id = f"{sid}_issue_{sanitize_id(t.target_col, 'unknown')}"
-                    lines.append(f'{issue_id} [label="{dot_escape(t.issue)}", shape=diamond];')
-                    lines.append(f'{sid} -> {issue_id} [label="Transformation"];')
-            if unresolved_count:
-                um_id = f"{sid}_unresolved"
-                lines.append(f'{um_id} [label="Unresolved Mapping", shape=diamond];')
-                lines.append(f'{sid} -> {um_id} [label="Transformation"];')
+    target_nodes: Dict[str, str] = {}
+    t_idx = 1
+    for name in [success_stage_name, exception_stage_name]:
+        if not name or name in target_nodes:
+            continue
+        stage = stage_by_name.get(name)
+        if not stage:
+            continue
+        nid = f"Target_{t_idx}"
+        t_idx += 1
+        target_nodes[name] = nid
+        is_exception = "seqfile" in stage.stage_type.lower() or "exception" in stage.name.lower()
+        shape = "note" if is_exception else "cylinder"
+        fill = "#FFCCBC" if is_exception else "#C8E6C9"
+        lines.append(f'{nid} [label="{dot_escape(stage.name)}", fillcolor="{fill}", shape={shape}];')
+    lines.append("}")
+    lines.append("")
 
-        defined = set(s.stage_vars_defined.keys())
-        constraint_ids: Dict[str, str] = {}
-        for cidx, c in enumerate(s.constraints, 1):
-            constraint_ids[c.expression] = f"{sid}_constraint_{cidx}"
-        for sv in s.stage_vars_used:
-            if sv in defined:
-                vid = f"{sid}_{sanitize_id(sv, 'sv')}"
-                lines.append(f'{vid} [label="{dot_escape(sv)}", shape=ellipse];')
-                lines.append(f'{vid} -> {sid} [label="Stage Variable"];')
-                for c in s.constraints:
-                    if re.search(rf"\b{re.escape(sv)}\b", c.expression):
-                        lines.append(f'{vid} -> {constraint_ids[c.expression]} [label="Constraint"];')
-            else:
-                vid = f"{sid}_{sanitize_id(sv, 'sv')}_undef"
-                lines.append(f'{vid} [label="Undefined Variable", shape=ellipse];')
-                lines.append(f'{vid} -> {sid} [label="Stage Variable"];')
-                for c in s.constraints:
-                    if re.search(rf"\b{re.escape(sv)}\b", c.expression):
-                        lines.append(f'{vid} -> {constraint_ids[c.expression]} [label="Constraint"];')
+    # Core flow edges
+    lines.append(f'Source_DB -> Transformer [label="{dot_escape(source_to_transform_link)}"];')
+    for i, (_, link_name) in enumerate(lookup_links, 1):
+        if i <= len(lookup_stages):
+            lines.append(f'Lookup_{i} -> Transformer [style=dashed, label="Lookup: {dot_escape(link_name)}"];')
+
+    for idx, jb in enumerate(source_stage.join_blocks, 1):
+        cond = jb.join_condition if jb.table_name in {"Subquery", "RawJoin"} else (jb.resolved_condition or jb.raw_join)
+        lines.append(f'Source_DB -> Join_{idx} [label="Join: {dot_escape(cond)}"];')
+
+    for idx, sv in enumerate(transformer_stage.stage_vars_used, 1):
+        lines.append(f'SV_{idx} -> Transformer [label="Transformation"];')
+        for cidx, c in enumerate(transformer_stage.constraints, 1):
+            if re.search(rf"\b{re.escape(sv)}\b", c.expression):
+                lines.append(f'SV_{idx} -> Constraint_{cidx} [label="Constraint"];')
+
+    if mapped_count > 15 or (transformed_columns > 25 and modified_count > 0):
+        lines.append('Transformer -> MapSummary [label="Transformation"];')
+
+    for cidx, c in enumerate(transformer_stage.constraints, 1):
+        lines.append(f'Transformer -> Constraint_{cidx} [label="Constraint"];')
+        yes_target, no_target = get_constraint_routes(transformer_stage, c.name)
+        yes_stage = input_link_to_stage.get(yes_target, success_stage_name)
+        no_stage = input_link_to_stage.get(no_target, exception_stage_name)
+        if yes_stage in target_nodes:
+            lines.append(f'Constraint_{cidx} -> {target_nodes[yes_stage]} [label="Yes"];')
+        if no_stage in target_nodes:
+            lines.append(f'Constraint_{cidx} -> {target_nodes[no_stage]} [label="No"];')
+
+    # Target chaining (e.g., hash -> oracle)
+    for src_name, src_node in target_nodes.items():
+        for dst_name, _ in downstream.get(src_name, []):
+            if dst_name in target_nodes:
+                lines.append(f"{src_node} -> {target_nodes[dst_name]} [label=\"Transformation\"];")
 
     lines.append("}")
     return "\n".join(lines)
