@@ -1,0 +1,280 @@
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+from graphviz import Source
+from graphviz.backend import ExecutableNotFound
+
+
+INPUT_FOLDER = "data/input"
+OUTPUT_FOLDER = "data/output"
+
+
+# ==============================
+# DATA STRUCTURES
+# ==============================
+
+@dataclass
+class Join:
+    join_type: str
+    table: str
+    condition: str
+
+
+@dataclass
+class Constraint:
+    name: str
+    expression: str
+
+
+@dataclass
+class Stage:
+    name: str
+    stage_type: str
+    inputs: List[str] = field(default_factory=list)
+    outputs: List[str] = field(default_factory=list)
+    joins: List[Join] = field(default_factory=list)
+    constraints: List[Constraint] = field(default_factory=list)
+    transformations: int = 0
+    sql_text: str = ""
+
+
+# ==============================
+# UTILITIES
+# ==============================
+
+def sanitize_id(name: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_]+", "_", name.strip())
+    if token and token[0].isdigit():
+        token = "n_" + token
+    return token or "node"
+
+
+def dot_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+# ==============================
+# SQL PROCESSING
+# ==============================
+
+def flatten_subqueries(sql: str) -> str:
+    """
+    Replace subqueries with base table references.
+    """
+    pattern = re.compile(r"\((\s*select .*?)\)\s+([A-Za-z_]\w*)",
+                         re.IGNORECASE | re.DOTALL)
+
+    while True:
+        match = pattern.search(sql)
+        if not match:
+            break
+
+        subquery_sql = match.group(1)
+        alias = match.group(2)
+
+        from_match = re.search(
+            r"\bfrom\b\s+([A-Za-z0-9_.$#]+)",
+            subquery_sql,
+            re.IGNORECASE
+        )
+
+        if from_match:
+            base_table = from_match.group(1)
+            replacement = f"{base_table} {alias}"
+        else:
+            replacement = alias
+
+        sql = sql[:match.start()] + replacement + sql[match.end():]
+
+    return sql
+
+
+def extract_tables(sql: str) -> List[str]:
+    tables = set()
+    for m in re.finditer(r"\b(from|join)\s+([A-Za-z0-9_.$#]+)",
+                         sql, re.IGNORECASE):
+        table = m.group(2)
+        if "." in table:
+            tables.add(table)
+    return list(tables)
+
+
+def parse_joins(sql: str) -> List[Join]:
+    joins = []
+    pattern = re.compile(
+        r"\b(LEFT|RIGHT|INNER|FULL|CROSS)?\s*(OUTER)?\s*JOIN\s+([A-Za-z0-9_.$#]+)\s*(?:\w+)?\s*ON\s+(.*?)(?=\b(LEFT|RIGHT|INNER|FULL|CROSS)?\s*(OUTER)?\s*JOIN|\bWHERE|\bGROUP|\bORDER|$)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in pattern.finditer(sql):
+        join_type = (match.group(1) or "JOIN").upper()
+        table = match.group(3)
+        condition = re.sub(r"\s+", " ", match.group(4)).strip()
+        joins.append(Join(join_type=join_type,
+                          table=table,
+                          condition=condition))
+    return joins
+
+
+# ==============================
+# PARSING STAGES
+# ==============================
+
+def parse_stage_blocks(text: str) -> List[Tuple[str, str]]:
+    stages = []
+    pattern = re.compile(
+        r"//\s*---\s*\[(.*?)\]\s*\[Lines.*?\]\s*---(.*?)(?=//\s*---|\Z)",
+        re.DOTALL,
+    )
+    for m in pattern.finditer(text):
+        header = m.group(1)
+        body = m.group(2)
+        stages.append((header, body))
+    return stages
+
+
+def parse_stages(text: str) -> List[Stage]:
+    parsed = []
+
+    for header, block in parse_stage_blocks(text):
+        name = header.split(":")[-1].strip()
+        stage_type_match = re.search(r"StageType:\s*([^\n]+)", block)
+        stage_type = stage_type_match.group(1).strip() if stage_type_match else "Unknown"
+
+        sql_match = re.search(r"SQL:\s*(.*?)(?=\n\s*(Output:|StageType:|Transformations:|Constraint|//\s*---|\Z))",
+                              block, re.DOTALL)
+        sql_text = sql_match.group(1).strip() if sql_match else ""
+
+        if sql_text:
+            sql_text = flatten_subqueries(sql_text)
+
+        tables = extract_tables(sql_text)
+        joins = parse_joins(sql_text)
+
+        outputs = re.findall(r"dataset_\d+\s*\((.*?)\)", block)
+
+        constraints = []
+        for m in re.finditer(r"Constraint\s*\((.*?)\)\s*:\s*(.*)",
+                             block):
+            constraints.append(Constraint(name=m.group(1),
+                                          expression=m.group(2)))
+
+        transformations = len(re.findall(r"=", block))
+
+        stage = Stage(
+            name=name,
+            stage_type=stage_type,
+            inputs=[],
+            outputs=outputs,
+            joins=joins,
+            constraints=constraints,
+            transformations=transformations,
+            sql_text=sql_text,
+        )
+
+        parsed.append(stage)
+
+    return parsed
+
+
+# ==============================
+# DOT GENERATION
+# ==============================
+
+def build_high_level_dot(stages: List[Stage]) -> str:
+    lines = [
+        "digraph lineage {",
+        "rankdir=LR;",
+        'node [shape=box, fontname="Arial"];'
+    ]
+
+    for stage in stages:
+        sid = sanitize_id(stage.name)
+        lines.append(f'{sid} [label="{dot_escape(stage.name)}"];')
+
+        for join in stage.joins:
+            table_id = sanitize_id(join.table)
+            lines.append(f'{table_id} [shape=cylinder, label="{join.table}"];')
+            lines.append(f'{table_id} -> {sid} [label="{join.join_type}"];')
+
+        for constraint in stage.constraints:
+            cid = sid + "_decision"
+            lines.append(f'{cid} [shape=diamond, label="{dot_escape(constraint.expression)}"];')
+            lines.append(f'{sid} -> {cid};')
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def build_detailed_dot(stages: List[Stage]) -> str:
+    lines = [
+        "digraph lineage_detailed {",
+        "rankdir=LR;",
+        'node [fontname="Arial"];'
+    ]
+
+    for stage in stages:
+        sid = sanitize_id(stage.name)
+        label = f"{stage.name}\\nTransformations: {stage.transformations}"
+        lines.append(f'{sid} [shape=box, label="{dot_escape(label)}"];')
+
+        for join in stage.joins:
+            table_id = sanitize_id(join.table)
+            lines.append(f'{table_id} [shape=cylinder, label="{join.table}"];')
+            lines.append(f'{table_id} -> {sid} [label="Join: {dot_escape(join.condition)}"];')
+
+        for constraint in stage.constraints:
+            cid = sid + "_decision"
+            lines.append(f'{cid} [shape=diamond, label="{dot_escape(constraint.expression)}"];')
+            lines.append(f'{sid} -> {cid} [label="Constraint"];')
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+# ==============================
+# MAIN EXECUTION
+# ==============================
+
+def process_file(file_path: str):
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+
+    stages = parse_stages(text)
+
+    high_dot = build_high_level_dot(stages)
+    detailed_dot = build_detailed_dot(stages)
+
+    base = sanitize_id(os.path.splitext(os.path.basename(file_path))[0])
+
+    high_path = os.path.join(OUTPUT_FOLDER, base + "_high.dot")
+    detailed_path = os.path.join(OUTPUT_FOLDER, base + "_detailed.dot")
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    with open(high_path, "w") as f:
+        f.write(high_dot)
+
+    with open(detailed_path, "w") as f:
+        f.write(detailed_dot)
+
+    try:
+        Source(high_dot).render(high_path, format="pdf", cleanup=True)
+        Source(detailed_dot).render(detailed_path, format="pdf", cleanup=True)
+    except ExecutableNotFound:
+        print("Graphviz not installed.")
+
+    print(f"Processed: {file_path}")
+
+
+def run_agent():
+    os.makedirs(INPUT_FOLDER, exist_ok=True)
+    files = [f for f in os.listdir(INPUT_FOLDER) if f.endswith(".txt")]
+
+    for file in files:
+        process_file(os.path.join(INPUT_FOLDER, file))
+
+
+if __name__ == "__main__":
+    run_agent()
