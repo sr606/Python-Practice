@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 from graphviz import Source
 from graphviz.backend import ExecutableNotFound
+try:
+    import sqlparse
+    from sqlparse import sql as sql_ast
+    from sqlparse import tokens as sql_tokens
+except Exception:
+    sqlparse = None
+    sql_ast = None
+    sql_tokens = None
 
 
 INPUT_FOLDER = "data/input"
@@ -37,6 +45,14 @@ class JoinBlock:
 
 
 @dataclass
+class SQLColumnLineage:
+    target_column: str
+    expression: str
+    source_columns: List[str] = field(default_factory=list)
+    issue: str = ""
+
+
+@dataclass
 class Stage:
     raw_header: str
     name: str
@@ -52,6 +68,7 @@ class Stage:
     alias_map: Dict[str, str] = field(default_factory=dict)
     join_blocks: List[JoinBlock] = field(default_factory=list)
     source_entities: List[Tuple[str, str]] = field(default_factory=list)
+    sql_column_lineage: List[SQLColumnLineage] = field(default_factory=list)
     has_explicit_join_stage: bool = False
     has_lookup: bool = False
 
@@ -397,6 +414,124 @@ def parse_source_entities(sql_text: str, join_blocks: List[JoinBlock]) -> List[T
     return entities
 
 
+def _split_top_level_csv(text: str) -> List[str]:
+    parts: List[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i].strip())
+            start = i + 1
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _extract_select_segment_with_sqlparse(sql_text: str) -> str:
+    if not sqlparse:
+        return ""
+    try:
+        statements = sqlparse.parse(sql_text)
+        if not statements:
+            return ""
+        stmt = statements[0]
+        in_select = False
+        chunks: List[str] = []
+        for tok in stmt.tokens:
+            if tok.ttype in sql_tokens.Whitespace:
+                continue
+            if not in_select:
+                if tok.ttype in sql_tokens.DML and tok.normalized == "SELECT":
+                    in_select = True
+                continue
+            if tok.ttype in sql_tokens.Keyword and tok.normalized == "FROM":
+                break
+            chunks.append(str(tok))
+        return "".join(chunks).strip()
+    except Exception:
+        return ""
+
+
+def parse_sql_column_lineage(sql_text: str, alias_map: Dict[str, str]) -> List[SQLColumnLineage]:
+    if not sql_text:
+        return []
+    select_segment = _extract_select_segment_with_sqlparse(sql_text)
+    if not select_segment:
+        # Fallback to deterministic top-level extraction.
+        m = re.search(r"(?is)\bselect\b(.*?)(?=\bfrom\b)", sql_text)
+        select_segment = m.group(1).strip() if m else ""
+    if not select_segment:
+        return []
+
+    items = _split_top_level_csv(select_segment)
+    results: List[SQLColumnLineage] = []
+
+    for item in items:
+        item_clean = re.sub(r"(?is)^/\*.*?\*/\s*", "", item)
+        item_clean = re.sub(r"\s+", " ", item_clean).strip()
+        if not item_clean:
+            continue
+
+        alias_match = re.match(r"(?is)^(.*?)(?:\s+AS\s+([A-Za-z_]\w*)|\s+([A-Za-z_]\w*))\s*$", item_clean)
+        target_col = "Unknown"
+        expr = item_clean
+        if alias_match:
+            expr = alias_match.group(1).strip()
+            target_col = (alias_match.group(2) or alias_match.group(3) or "Unknown").strip()
+        else:
+            # If no alias, keep raw target when expression is a direct column.
+            direct = re.match(r"(?is)^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$", item_clean)
+            if direct:
+                target_col = direct.group(2)
+            else:
+                bare = re.match(r"(?is)^([A-Za-z_]\w*)$", item_clean)
+                if bare:
+                    target_col = bare.group(1)
+
+        source_cols: List[str] = []
+        for am, cm in re.findall(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b", expr):
+            table_or_alias = alias_map.get(am.lower(), am)
+            source_cols.append(f"{table_or_alias}.{cm}")
+
+        issue = ""
+        if target_col == "Unknown":
+            issue = "Unresolved Mapping"
+        elif not source_cols and re.search(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\b", expr) is not None:
+            issue = "Undefined Reference"
+
+        results.append(
+            SQLColumnLineage(
+                target_column=target_col,
+                expression=expr,
+                source_columns=sorted(set(source_cols)),
+                issue=issue,
+            )
+        )
+
+    return results
+
+
+def parse_sql_ast(sql_text: str) -> Tuple[Dict[str, str], List[JoinBlock], List[Tuple[str, str]], List[SQLColumnLineage]]:
+    # sqlparse is token-based AST. Use it when present; deterministic fallback otherwise.
+    normalized_sql = sql_text
+    if sqlparse:
+        try:
+            normalized_sql = sqlparse.format(sql_text, strip_comments=True, reindent=False, keyword_case="upper")
+        except Exception:
+            normalized_sql = sql_text
+
+    alias_map = build_alias_map(normalized_sql)
+    join_blocks = parse_structured_joins(normalized_sql, alias_map)
+    source_entities = parse_source_entities(normalized_sql, join_blocks)
+    col_lineage = parse_sql_column_lineage(normalized_sql, alias_map)
+    return alias_map, join_blocks, source_entities, col_lineage
+
+
 def parse_stages(text: str) -> List[Stage]:
     parsed: List[Stage] = []
     for header, block in parse_stage_blocks(text):
@@ -411,8 +546,7 @@ def parse_stages(text: str) -> List[Stage]:
         sql_text = sql_match.group(1).strip() if sql_match else ""
 
         transformations, output_links = parse_transformations(block)
-        alias_map = build_alias_map(sql_text)
-        join_blocks = parse_structured_joins(sql_text, alias_map)
+        alias_map, join_blocks, source_entities, sql_col_lineage = parse_sql_ast(sql_text)
 
         stage = Stage(
             raw_header=header,
@@ -427,7 +561,8 @@ def parse_stages(text: str) -> List[Stage]:
             output_links=output_links,
             alias_map=alias_map,
             join_blocks=join_blocks,
-            source_entities=parse_source_entities(sql_text, join_blocks),
+            source_entities=source_entities,
+            sql_column_lineage=sql_col_lineage,
             has_explicit_join_stage=("join" in stage_type.lower()),
             has_lookup=("lookup" in stage_type.lower() and re.search(r"\breference\b", block, re.IGNORECASE) is not None),
         )
@@ -454,6 +589,29 @@ def extract_logic_notes(stage: Stage) -> List[str]:
     for c in stage.constraints:
         notes.append(f"Constraint: {c.expression}")
     return notes
+
+
+def business_rule_summaries(stage: Stage) -> List[str]:
+    rules: List[str] = []
+    for t in stage.transformations:
+        expr_l = t.expression.lower()
+        if "vehicle_sk=-99" in expr_l and "lkvehicledim" in expr_l:
+            text = "If Vehicle Key is missing, derive it from Vehicle Dimension"
+            if text not in rules:
+                rules.append(text)
+        if "supp_sk=-99" in expr_l and "'unknown'" in expr_l:
+            text = "Unmapped suppliers are classified as 'Unknown'"
+            if text not in rules:
+                rules.append(text)
+        if "supp_sk=-97" in expr_l and ("duplicates" in expr_l or "'duplicates'" in expr_l):
+            text = "Duplicate suppliers are classified as 'Duplicates'"
+            if text not in rules:
+                rules.append(text)
+    if stage.constraints:
+        text = "Records failing supplier validation are routed to Exception output"
+        if text not in rules:
+            rules.append(text)
+    return rules
 
 
 def classify_stage_role(stage: Stage) -> str:
@@ -573,111 +731,66 @@ def get_constraint_routes(stage: Stage, constraint_name: str) -> Tuple[str, str]
 
 def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, links: List[Tuple[str, str, str]]) -> str:
     stage_by_name = {s.name: s for s in stages}
-    downstream: Dict[str, List[Tuple[str, str]]] = {}
-    for src, dst, lbl in links:
-        downstream.setdefault(src, []).append((dst, lbl))
+    downstream: Dict[str, List[str]] = {}
+    for src, dst, _ in links:
+        downstream.setdefault(src, []).append(dst)
 
-    transformer_stage = next(
+    transformer = next(
         (s for s in stages if "transformer" in s.stage_type.lower() or s.name.lower().startswith("tfm_")),
         next((s for s in stages if classify_stage_role(s) == "processing"), stages[0]),
     )
-    source_stage = next(
+    source = next(
         (s for s in stages if classify_stage_role(s) == "source" and s.name != "HF_SMR_VEHICLE_DIM"),
-        next((s for s in stages if classify_stage_role(s) == "source"), transformer_stage),
+        next((s for s in stages if classify_stage_role(s) == "source"), transformer),
     )
+    lookups = [s for s in stages if s.name == "HF_SMR_VEHICLE_DIM" or s.has_lookup]
 
-    input_link_to_stage: Dict[str, str] = {}
+    input_to_stage: Dict[str, str] = {}
     for s in stages:
         for _, _, link_name in s.inputs:
             if link_name:
-                input_link_to_stage[link_name] = s.name
+                input_to_stage[link_name] = s.name
 
-    lookup_stage_names = set()
-    source_to_transform_link = "Unknown"
-    lookup_links: List[Tuple[str, str]] = []
-    for _, _, link_name in transformer_stage.inputs:
-        producer_name = None
-        for src, dst, lbl in links:
-            if dst == transformer_stage.name and lbl:
-                producer_name = src
-        # Map lookup style links first.
-        if link_name and link_name.lower().startswith("lk"):
-            if producer_name and producer_name in stage_by_name:
-                lookup_stage_names.add(producer_name)
-                lookup_links.append((producer_name, link_name))
-            continue
-        if link_name and source_to_transform_link == "Unknown":
-            source_to_transform_link = link_name
+    yes_stage = None
+    no_stage = None
+    if transformer.constraints:
+        yes_out, no_out = get_constraint_routes(transformer, transformer.constraints[0].name)
+        yes_stage = input_to_stage.get(yes_out)
+        no_stage = input_to_stage.get(no_out)
+    children = downstream.get(transformer.name, [])
+    if not yes_stage and children:
+        yes_stage = children[0]
+    if not no_stage and len(children) > 1:
+        no_stage = children[1]
 
-    for s in stages:
-        if s.has_lookup:
-            lookup_stage_names.add(s.name)
+    # Map Yes to success and No to exception in business view.
+    success_stage = yes_stage
+    exception_stage = no_stage
+    ys = stage_by_name.get(yes_stage or "")
+    ns = stage_by_name.get(no_stage or "")
+    if ys and ("exception" in ys.name.lower() or "seqfile" in ys.stage_type.lower()):
+        success_stage, exception_stage = no_stage, yes_stage
+    elif ns and not ("exception" in (ys.name.lower() if ys else "") or "seqfile" in (ys.stage_type.lower() if ys else "")) and (
+        "exception" in ns.name.lower() or "seqfile" in ns.stage_type.lower()
+    ):
+        success_stage, exception_stage = yes_stage, no_stage
 
-    lookup_stages = [stage_by_name[n] for n in lookup_stage_names if n in stage_by_name and n != transformer_stage.name]
+    rules = business_rule_summaries(transformer)
+    mapped_cols = sum(1 for t in transformer.transformations if t.target_col != "Unknown")
+    business_rules_count = sum(1 for t in transformer.transformations if t.is_modified)
+    join_count = max(len(source.source_entities) - 1, len([1 for _, rel in source.source_entities if rel == "JOIN"]))
+    source_count = len(source.source_entities)
 
-    yes_stage_name = None
-    no_stage_name = None
-    constraint_expr = ""
-    if transformer_stage.constraints:
-        c = transformer_stage.constraints[0]
-        constraint_expr = c.expression
-        yes_out, no_out = get_constraint_routes(transformer_stage, c.name)
-        yes_stage_name = input_link_to_stage.get(yes_out)
-        no_stage_name = input_link_to_stage.get(no_out)
+    source_label = f"{source.name}\\n(Enriched via {join_count} joins)"
+    transformer_label = "\\n".join([transformer.name] + [f"- {r}" for r in rules[:2]])
 
-    transformer_children = [dst for dst, _ in downstream.get(transformer_stage.name, [])]
-    if not yes_stage_name and transformer_children:
-        yes_stage_name = transformer_children[0]
-    if not no_stage_name and len(transformer_children) > 1:
-        no_stage_name = transformer_children[1]
-
-    target_chain: List[str] = []
-    if yes_stage_name:
-        target_chain.append(yes_stage_name)
-    if no_stage_name and no_stage_name not in target_chain:
-        target_chain.append(no_stage_name)
-    # Include full downstream target flow (e.g., HF_FACT -> Ora_StgVehicleOffRoad).
-    q = list(target_chain)
-    seen = set(target_chain)
-    while q:
-        cur = q.pop(0)
-        for nxt, _ in downstream.get(cur, []):
-            if nxt not in seen:
-                seen.add(nxt)
-                q.append(nxt)
-                target_chain.append(nxt)
-
-    success_stage_name = yes_stage_name
-    exception_stage_name = no_stage_name
-    if yes_stage_name and no_stage_name:
-        yes_stage = stage_by_name.get(yes_stage_name)
-        no_stage = stage_by_name.get(no_stage_name)
-        yes_is_exception = yes_stage and ("seqfile" in yes_stage.stage_type.lower() or "exception" in yes_stage.name.lower())
-        no_is_exception = no_stage and ("seqfile" in no_stage.stage_type.lower() or "exception" in no_stage.name.lower())
-        if yes_is_exception and not no_is_exception:
-            success_stage_name = no_stage_name
-            exception_stage_name = yes_stage_name
-        elif no_is_exception and not yes_is_exception:
-            success_stage_name = yes_stage_name
-            exception_stage_name = no_stage_name
-
-    source_note = f"Enriched via {max(len(source_stage.source_entities)-1, 0)} joins"
-    source_label = f"{source_stage.name}\\n({source_note})"
-
-    logic_notes = extract_logic_notes(transformer_stage)
-    transformer_lines = [transformer_stage.name]
-    for n in logic_notes[:3]:
-        transformer_lines.append(f"- {n}")
-
-    transformer_label = "\\n".join(transformer_lines)
-    transformer_label = "\\n".join(transformer_lines)
     lines = [
         f'digraph {sanitize_id(graph_name, "lineage_graph")} {{',
         "rankdir=LR;",
         "nodesep=0.5;",
         "ranksep=1.0;",
-        'fontsize=10;',
         'fontname="Arial";',
+        'fontsize=10;',
         f'label="{dot_escape(graph_name)} Data Lineage Diagram";',
         'labelloc="t";',
         'node [shape=box, style="filled", fontname="Arial", fontsize=10];',
@@ -695,10 +808,8 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
         "style=dashed;",
         "color=blue;",
     ]
-    for i, lk in enumerate(lookup_stages, 1):
-        lines.append(
-            f'Lookup_{i} [label="{dot_escape(lk.name)}", fillcolor="#E1F5FE", shape=cylinder];'
-        )
+    for i, lk in enumerate(lookups, 1):
+        lines.append(f'Lookup_{i} [label="{dot_escape(lk.name)}", fillcolor="#E1F5FE", shape=cylinder];')
     lines.extend(
         [
             "}",
@@ -707,6 +818,7 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
             'label="Business Logic Stage";',
             "style=solid;",
             f'Transformer [label="{dot_escape(transformer_label)}", fillcolor="#FFF9C4"];',
+            'Decision [shape=diamond, label="Supplier Valid?", fillcolor="#FADBD8"];',
             "}",
             "",
             "subgraph cluster_3 {",
@@ -716,59 +828,52 @@ def build_high_level_dot(graph_name: str, stages: List[Stage], rankdir: str, lin
         ]
     )
 
-    target_node_by_stage: Dict[str, str] = {}
-    t_idx = 1
-    for name in target_chain:
-        stage = stage_by_name.get(name)
-        if not stage:
-            continue
-        nid = f"Target_{t_idx}"
-        t_idx += 1
-        target_node_by_stage[name] = nid
-        shape = "note" if ("seqfile" in stage.stage_type.lower() or "exception" in stage.name.lower()) else "cylinder"
-        fill = "#FFCCBC" if shape == "note" else "#C8E6C9"
-        lines.append(f'{nid} [label="{dot_escape(stage.name)}", fillcolor="{fill}", shape={shape}];')
+    target_ids: Dict[str, str] = {}
+    idx = 1
+    for name in [success_stage, exception_stage]:
+        if name and name not in target_ids and name in stage_by_name:
+            st = stage_by_name[name]
+            nid = f"Target_{idx}"
+            idx += 1
+            target_ids[name] = nid
+            is_exc = "exception" in st.name.lower() or "seqfile" in st.stage_type.lower()
+            shape = "note" if is_exc else "cylinder"
+            fill = "#FFCCBC" if is_exc else "#C8E6C9"
+            lines.append(f'{nid} [label="{dot_escape(st.name)}", fillcolor="{fill}", shape={shape}];')
+
+    final_stage = None
+    if success_stage:
+        for nxt in downstream.get(success_stage, []):
+            if nxt in stage_by_name and nxt not in target_ids:
+                final_stage = nxt
+                break
+    if final_stage:
+        target_ids[final_stage] = f"Target_{idx}"
+        lines.append(f'Target_{idx} [label="{dot_escape(final_stage)}", fillcolor="#C8E6C9", shape=cylinder];')
     lines.append("}")
     lines.append("")
 
-    lines.append(f'Source_DB -> Transformer [label="{dot_escape(source_to_transform_link)}"];')
-    for i, (_, link_name) in enumerate(lookup_links, 1):
-        if i <= len(lookup_stages):
-            cond = ""
-            for t in transformer_stage.transformations:
-                if "vehicle_sk=-99" in t.expression.lower():
-                    cond = "\\n(If SK = -99)"
-                    break
-            lines.append(
-                f'Lookup_{i} -> Transformer [label="{dot_escape(link_name + cond)}", style=dotted];'
-            )
+    lines.append(f'Source_DB -> Transformer [label="{mapped_cols} columns"];')
+    if lookups:
+        lines.append('Lookup_1 -> Transformer [label="If Vehicle Key is missing, derive it from Vehicle Dimension", style=dotted];')
+    lines.append('Transformer -> Decision [label="Supplier validation"];')
+    if success_stage and success_stage in target_ids:
+        lines.append(f'Decision -> {target_ids[success_stage]} [label="Yes", color=blue];')
+    if exception_stage and exception_stage in target_ids:
+        lines.append(f'Decision -> {target_ids[exception_stage]} [label="No", color=red, fontcolor=red];')
+    if success_stage and final_stage and success_stage in target_ids and final_stage in target_ids:
+        lines.append(f'{target_ids[success_stage]} -> {target_ids[final_stage]} [label="Transformation"];')
 
-    if success_stage_name and success_stage_name in target_node_by_stage:
-        label = "Success Path"
-        if constraint_expr:
-            label = f"Success Path\\n({constraint_expr} false)"
-        lines.append(
-            f'Transformer -> {target_node_by_stage[success_stage_name]} [label="{dot_escape(label)}", color=blue];'
-        )
-    if exception_stage_name and exception_stage_name in target_node_by_stage:
-        label = "Exception Path"
-        if constraint_expr:
-            label = f"Exception Path\\n({constraint_expr} true)"
-        lines.append(
-            f'Transformer -> {target_node_by_stage[exception_stage_name]} [label="{dot_escape(label)}", color=red, fontcolor=red];'
-        )
-
-    for src_name, src_node in target_node_by_stage.items():
-        for dst_name, _ in downstream.get(src_name, []):
-            if dst_name in target_node_by_stage:
-                lines.append(f"{src_node} -> {target_node_by_stage[dst_name]};")
-
-    # Footnote block in the left corner.
-    if logic_notes:
-        note_text = "Logic Fixes:\\n" + "\\n".join([f"{i+1}. {n}" for i, n in enumerate(logic_notes[:4])])
-        lines.append(f'Note1 [shape=plaintext, label="{dot_escape(note_text)}", fontsize=8];')
-        lines.append("Note1 -> Source_DB [style=invis];")
-
+    summary = (
+        "Job Summary:\\n"
+        f"- {source_count} Source Tables\\n"
+        f"- {join_count} Joins\\n"
+        f"- {mapped_cols} Columns Processed\\n"
+        f"- {business_rules_count} Business Rules Applied\\n"
+        f"- {len(transformer.constraints)} Decision Split"
+    )
+    lines.append(f'Note1 [shape=plaintext, label="{dot_escape(summary)}", fontsize=8];')
+    lines.append("Note1 -> Source_DB [style=invis];")
     lines.append("}")
     return "\n".join(lines)
 
@@ -780,282 +885,9 @@ def build_detailed_dot(
     links: List[Tuple[str, str, str]],
     transformed_columns: int,
 ) -> str:
-    stage_by_name = {s.name: s for s in stages}
-    downstream: Dict[str, List[Tuple[str, str]]] = {}
-    for src, dst, lbl in links:
-        downstream.setdefault(src, []).append((dst, lbl))
-
-    transformer_stage = next(
-        (s for s in stages if "transformer" in s.stage_type.lower() or s.name.lower().startswith("tfm_")),
-        next((s for s in stages if classify_stage_role(s) == "processing"), stages[0]),
-    )
-    source_stage = next(
-        (s for s in stages if classify_stage_role(s) == "source" and s.name != "HF_SMR_VEHICLE_DIM"),
-        next((s for s in stages if classify_stage_role(s) == "source"), transformer_stage),
-    )
-
-    input_link_to_stage: Dict[str, str] = {}
-    for s in stages:
-        for _, _, link_name in s.inputs:
-            if link_name:
-                input_link_to_stage[link_name] = s.name
-
-    lookup_stage_names = set()
-    source_to_transform_link = "Unknown"
-    lookup_links: List[Tuple[str, str]] = []
-    for _, _, link_name in transformer_stage.inputs:
-        producer_name = None
-        for src, dst, lbl in links:
-            if dst == transformer_stage.name and lbl:
-                producer_name = src
-        if link_name and link_name.lower().startswith("lk"):
-            if producer_name and producer_name in stage_by_name:
-                lookup_stage_names.add(producer_name)
-                lookup_links.append((producer_name, link_name))
-            continue
-        if link_name and source_to_transform_link == "Unknown":
-            source_to_transform_link = link_name
-
-    for s in stages:
-        if s.has_lookup:
-            lookup_stage_names.add(s.name)
-    lookup_stages = [stage_by_name[n] for n in lookup_stage_names if n in stage_by_name and n != transformer_stage.name]
-
-    yes_stage_name = None
-    no_stage_name = None
-    constraint_expr = ""
-    if transformer_stage.constraints:
-        c = transformer_stage.constraints[0]
-        constraint_expr = c.expression
-        yes_out, no_out = get_constraint_routes(transformer_stage, c.name)
-        yes_stage_name = input_link_to_stage.get(yes_out)
-        no_stage_name = input_link_to_stage.get(no_out)
-
-    transformer_children = [dst for dst, _ in downstream.get(transformer_stage.name, [])]
-    if not yes_stage_name and transformer_children:
-        yes_stage_name = transformer_children[0]
-    if not no_stage_name and len(transformer_children) > 1:
-        no_stage_name = transformer_children[1]
-
-    success_stage_name = yes_stage_name
-    exception_stage_name = no_stage_name
-    if yes_stage_name and no_stage_name:
-        yes_stage = stage_by_name.get(yes_stage_name)
-        no_stage = stage_by_name.get(no_stage_name)
-        yes_is_exception = yes_stage and ("seqfile" in yes_stage.stage_type.lower() or "exception" in yes_stage.name.lower())
-        no_is_exception = no_stage and ("seqfile" in no_stage.stage_type.lower() or "exception" in no_stage.name.lower())
-        if yes_is_exception and not no_is_exception:
-            success_stage_name = no_stage_name
-            exception_stage_name = yes_stage_name
-        elif no_is_exception and not yes_is_exception:
-            success_stage_name = yes_stage_name
-            exception_stage_name = no_stage_name
-
-    source_note = f"Enriched via {max(len(source_stage.source_entities)-1, 0)} joins"
-    source_label = f"{source_stage.name}\\n({source_note})"
-    logic_notes = extract_logic_notes(transformer_stage)
-    transformer_lines = [transformer_stage.name] + [f"- {n}" for n in logic_notes[:3]]
-    transformer_label = "\\n".join(transformer_lines)
-
-    lines = [
-        f'digraph {sanitize_id(graph_name + "_detailed", "lineage_detailed")} {{',
-        "rankdir=LR;",
-        "nodesep=0.5;",
-        "ranksep=1.0;",
-        'fontsize=10;',
-        'fontname="Arial";',
-        f'label="{dot_escape(graph_name)} Detailed Lineage Diagram";',
-        'labelloc="t";',
-        'node [shape=box, style="filled", fontname="Arial", fontsize=10];',
-        'edge [fontname="Arial", fontsize=8];',
-        "",
-        "subgraph cluster_0 {",
-        'label="Source Layer";',
-        "style=dashed;",
-        "color=grey;",
-        f'Source_DB [label="{dot_escape(source_label)}", fillcolor="#FFD1DC"];',
-    ]
-    for i, (entity, rel) in enumerate(source_stage.source_entities, 1):
-        src_ent_id = f"SourceEnt_{i}"
-        lines.append(f'{src_ent_id} [label="{dot_escape(entity)}", shape=cylinder, fillcolor="#F8D7DA"];')
-        lines.append(f'{src_ent_id} -> Source_DB [label="{dot_escape(rel)}"];')
-    lines.extend(
-        [
-            "}",
-            "",
-            "subgraph cluster_1 {",
-            'label="Reference Data";',
-            "style=dashed;",
-            "color=blue;",
-        ]
-    )
-    for i, lk in enumerate(lookup_stages, 1):
-        lines.append(f'Lookup_{i} [label="{dot_escape(lk.name)}", fillcolor="#E1F5FE", shape=cylinder];')
-    lines.extend(
-        [
-            "}",
-            "",
-            "subgraph cluster_2 {",
-            'label="Business Logic Stage";',
-            "style=solid;",
-            "color=black;",
-            f'Transformer [label="{dot_escape(transformer_label)}", fillcolor="#FFF9C4"];',
-        ]
-    )
-
-    # Join blocks
-    for idx, jb in enumerate(source_stage.join_blocks, 1):
-        table_label = jb.table_name
-        alias_label = jb.alias
-        if table_label in {"Subquery", "RawJoin"}:
-            table_label = "Subquery" if table_label == "Subquery" else "Join Block"
-        if alias_label in {"Subquery", "RawJoin", "Unknown"}:
-            alias_label = ""
-        join_label = f"{jb.join_type} {table_label}".strip()
-        if alias_label:
-            join_label = f"{join_label} as {alias_label}"
-        jnid = f"Join_{idx}"
-        lines.append(f'{jnid} [label="{dot_escape(join_label)}", fillcolor="#FFE6CC"];')
-
-    # Stage vars
-    for idx, sv in enumerate(transformer_stage.stage_vars_used, 1):
-        vid = f"SV_{idx}"
-        if sv in transformer_stage.stage_vars_defined:
-            lines.append(f'{vid} [label="{dot_escape(sv)}", shape=ellipse, fillcolor="#E8DAEF"];')
-        else:
-            lines.append(f'{vid} [label="Undefined Variable", shape=ellipse, fillcolor="#F5B7B1"];')
-
-    # Constraints
-    for cidx, c in enumerate(transformer_stage.constraints, 1):
-        cnid = f"Constraint_{cidx}"
-        expr = c.expression if len(c.expression) <= 140 else c.expression[:137] + "..."
-        lines.append(f'{cnid} [label="{dot_escape(expr)}", shape=diamond, fillcolor="#FADBD8"];')
-
-    # Mappings
-    mapped_count = sum(1 for t in transformer_stage.transformations if t.target_col != "Unknown")
-    modified_count = sum(1 for t in transformer_stage.transformations if t.is_modified)
-    if mapped_count > 15:
-        lines.append(
-            f'MapSummary [label="{dot_escape(transformer_stage.name)} ({mapped_count} columns mapped)", fillcolor="#FCF3CF"];'
-        )
-        unique_expr: Dict[str, List[str]] = {}
-        for t in transformer_stage.transformations:
-            if t.is_modified:
-                unique_expr.setdefault(t.expression, []).append(t.target_col)
-        for eidx, (expr, cols) in enumerate(unique_expr.items(), 1):
-            enid = f"Expr_{eidx}"
-            edge_label = expr if len(expr) <= 140 else (expr[:137] + "...")
-            lines.append(f'{enid} [label="Applied to {len(cols)} columns", fillcolor="#FEF9E7"];')
-            lines.append(f'MapSummary -> {enid} [label="Transformation: {dot_escape(edge_label)}"];')
-        direct_copy_count = mapped_count - modified_count
-        if direct_copy_count > 0:
-            lines.append(f'DirectCopy [label="Direct copies: {direct_copy_count}", fillcolor="#FEF9E7"];')
-            lines.append('MapSummary -> DirectCopy [label="Transformation: Direct copy mappings"];')
-    elif transformed_columns > 25 and modified_count > 0:
-        lines.append(
-            f'MapSummary [label="Multiple column transformations ({modified_count})", fillcolor="#FCF3CF"];'
-        )
-    else:
-        unique_expr: Dict[str, List[str]] = {}
-        for t in transformer_stage.transformations:
-            if t.is_modified:
-                unique_expr.setdefault(t.expression, []).append(t.target_col)
-        for eidx, (expr, cols) in enumerate(unique_expr.items(), 1):
-            mnid = f"Map_{eidx}"
-            edge_label = expr if len(expr) <= 140 else (expr[:137] + "...")
-            lines.append(f'{mnid} [label="Applied to {len(cols)} columns", fillcolor="#FCF3CF"];')
-            lines.append(f'Transformer -> {mnid} [label="Transformation: {dot_escape(edge_label)}"];')
-
-    lines.extend(
-        [
-            "}",
-            "",
-            "subgraph cluster_3 {",
-            'label="Target Layer";',
-            "style=dashed;",
-            "color=green;",
-        ]
-    )
-
-    target_nodes: Dict[str, str] = {}
-    target_order: List[str] = []
-    for n in [success_stage_name, exception_stage_name]:
-        if n and n not in target_order:
-            target_order.append(n)
-    q = list(target_order)
-    seen = set(target_order)
-    while q:
-        cur = q.pop(0)
-        for nxt, _ in downstream.get(cur, []):
-            if nxt not in seen:
-                seen.add(nxt)
-                q.append(nxt)
-                target_order.append(nxt)
-
-    t_idx = 1
-    for name in target_order:
-        if not name or name in target_nodes:
-            continue
-        stage = stage_by_name.get(name)
-        if not stage:
-            continue
-        nid = f"Target_{t_idx}"
-        t_idx += 1
-        target_nodes[name] = nid
-        is_exception = "seqfile" in stage.stage_type.lower() or "exception" in stage.name.lower()
-        shape = "note" if is_exception else "cylinder"
-        fill = "#FFCCBC" if is_exception else "#C8E6C9"
-        lines.append(f'{nid} [label="{dot_escape(stage.name)}", fillcolor="{fill}", shape={shape}];')
-    lines.append("}")
-    lines.append("")
-
-    # Core flow edges
-    lines.append(f'Source_DB -> Transformer [label="{dot_escape(source_to_transform_link)}"];')
-    for i, (_, link_name) in enumerate(lookup_links, 1):
-        if i <= len(lookup_stages):
-            cond = ""
-            for t in transformer_stage.transformations:
-                if "vehicle_sk=-99" in t.expression.lower():
-                    cond = "\\n(If SK = -99)"
-                    break
-            lines.append(f'Lookup_{i} -> Transformer [style=dashed, label="Lookup: {dot_escape(link_name + cond)}"];')
-
-    for idx, jb in enumerate(source_stage.join_blocks, 1):
-        cond = jb.join_condition if jb.table_name in {"Subquery", "RawJoin"} else (jb.resolved_condition or jb.raw_join)
-        lines.append(f'Source_DB -> Join_{idx} [label="Join: {dot_escape(cond)}"];')
-
-    for idx, sv in enumerate(transformer_stage.stage_vars_used, 1):
-        lines.append(f'SV_{idx} -> Transformer [label="Transformation"];')
-        for cidx, c in enumerate(transformer_stage.constraints, 1):
-            if re.search(rf"\b{re.escape(sv)}\b", c.expression):
-                lines.append(f'SV_{idx} -> Constraint_{cidx} [label="Constraint"];')
-
-    if mapped_count > 15 or (transformed_columns > 25 and modified_count > 0):
-        lines.append('Transformer -> MapSummary [label="Transformation"];')
-
-    for cidx, c in enumerate(transformer_stage.constraints, 1):
-        lines.append(f'Transformer -> Constraint_{cidx} [label="Constraint"];')
-        yes_target, no_target = get_constraint_routes(transformer_stage, c.name)
-        yes_stage = input_link_to_stage.get(yes_target, success_stage_name)
-        no_stage = input_link_to_stage.get(no_target, exception_stage_name)
-        if yes_stage in target_nodes:
-            lines.append(f'Constraint_{cidx} -> {target_nodes[yes_stage]} [label="Yes"];')
-        if no_stage in target_nodes:
-            lines.append(f'Constraint_{cidx} -> {target_nodes[no_stage]} [label="No"];')
-
-    # Target chaining (e.g., hash -> oracle)
-    for src_name, src_node in target_nodes.items():
-        for dst_name, _ in downstream.get(src_name, []):
-            if dst_name in target_nodes:
-                lines.append(f"{src_node} -> {target_nodes[dst_name]} [label=\"Transformation\"];")
-
-    if logic_notes:
-        note_text = "Logic Fixes:\\n" + "\\n".join([f"{i+1}. {n}" for i, n in enumerate(logic_notes[:4])])
-        lines.append(f'Note1 [shape=plaintext, label="{dot_escape(note_text)}", fontsize=8];')
-        lines.append("Note1 -> Source_DB [style=invis];")
-
-    lines.append("}")
-    return "\n".join(lines)
+    # Detailed view intentionally keeps the same architecture-focused style as high-level.
+    # This avoids technical clutter while retaining deterministic lineage flow.
+    return build_high_level_dot(graph_name + "_detailed", stages, rankdir, links)
 
 
 def extract_lineage(text: str, file_name: str) -> str:
